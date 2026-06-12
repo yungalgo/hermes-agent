@@ -407,6 +407,30 @@ Override these on your provider class for richer integration:
 
 See `agent/tts_provider.py` for the full ABC including docstrings.
 
+### Gradium (bundled plugin)
+
+[Gradium](https://gradium.ai) — the streaming-first speech API from the Kyutai/Moshi team — ships in-tree as a bundled TTS plugin (`plugins/tts/gradium/`), the first consumer of the plugin surface above. It auto-loads; select it with `tts.provider: gradium`.
+
+```yaml
+tts:
+  provider: gradium
+  output_format: wav      # wav | opus | pcm
+  gradium:
+    voice_id: ""          # voice uid; empty = server default voice
+```
+
+```bash
+# In ~/.hermes/.env
+GRADIUM_API_KEY=your_key   # from https://gradium.ai
+```
+
+Notes:
+
+- **Formats:** Gradium outputs `wav`, `pcm`, or `opus` only — there is no MP3. Requests for `mp3`/`flac` are written as WAV (the file extension is rewritten accordingly); `ogg` requests are written as Opus. Voice-bubble delivery works out of the box (`voice_compatible` is on; ffmpeg converts WAV → Opus when a platform needs it).
+- **Streaming:** the plugin overrides `stream()` — audio arrives as chunked bytes decoded from Gradium's message stream (`ready` handshake, base64 `audio` chunks, word-timestamp `text` messages, terminal `end_of_stream`).
+- **Voices:** ~250 voices across 5 languages, listed live via `list_voices()` in the `hermes tools` voice picker. Instant voice cloning is available on the Gradium side; cloned voices show up in the same catalog.
+- **No new dependency:** the plugin uses `httpx` (already a core dependency) — no SDK install step.
+
 ## Voice Message Transcription (STT)
 
 Voice messages sent on Telegram, Discord, WhatsApp, Slack, or Signal are automatically transcribed and injected as text into the conversation. The agent sees the transcript as normal text.

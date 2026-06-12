@@ -1,0 +1,9 @@
+name: gradium
+version: 1.0.0
+description: "Gradium (https://gradium.ai) streaming-first TTS backend. Requires GRADIUM_API_KEY. Native wav/pcm/opus output, ~250 voices across 5 languages, chunked streaming synthesis via stream()."
+author: yung algorithm (yungalgo)
+kind: backend
+requires_env:
+  - GRADIUM_API_KEY
+provides_tts_providers:
+  - gradium

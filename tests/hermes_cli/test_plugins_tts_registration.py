@@ -109,10 +109,12 @@ class TestRegisterTTSProvider:
             mgr = PluginManager()
             mgr.discover_and_load()
 
-        # Plugin loaded (register returned normally), but registry empty.
+        # Plugin loaded (register returned normally), but nothing beyond
+        # the bundled backends (plugins/tts/gradium) reached the registry.
         assert mgr._plugins["bad-tts-plugin"].enabled is True
         assert tts_registry.get_provider("not a provider") is None
-        assert tts_registry.list_providers() == []
+        names = {p.name for p in tts_registry.list_providers()}
+        assert names <= {"gradium"}
         assert "does not inherit from TTSProvider" in caplog.text
 
         tts_registry._reset_for_tests()

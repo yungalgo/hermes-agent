@@ -43,8 +43,14 @@ def _reset_registry():
 class TestPluginTTSProviders:
     """``_plugin_tts_providers()`` returns picker-row dicts."""
 
-    def test_empty_when_no_plugins(self):
-        assert tools_config._plugin_tts_providers() == []
+    def test_bundled_gradium_only_by_default(self):
+        """With no user plugins, the only plugin rows come from bundled
+        backends — today exactly ``plugins/tts/gradium``."""
+        from hermes_cli.plugins import _ensure_plugins_discovered
+
+        _ensure_plugins_discovered(force=True)
+        rows = tools_config._plugin_tts_providers()
+        assert [r["tts_plugin_name"] for r in rows] == ["gradium"]
 
     def test_returns_row_for_registered_plugin(self):
         tts_registry.register_provider(
@@ -62,8 +68,9 @@ class TestPluginTTSProviders:
             )
         )
         rows = tools_config._plugin_tts_providers()
-        assert len(rows) == 1
-        row = rows[0]
+        by_plugin = {r["tts_plugin_name"]: r for r in rows}
+        assert "cartesia" in by_plugin
+        row = by_plugin["cartesia"]
         assert row["name"] == "Cartesia"
         assert row["badge"] == "paid"
         assert row["tag"] == "Ultra-low-latency streaming"
@@ -86,7 +93,7 @@ class TestPluginTTSProviders:
         tts_registry._providers["edge"] = provider  # type: ignore[index]
         try:
             rows = tools_config._plugin_tts_providers()
-            assert rows == [], (
+            assert all(r.get("tts_plugin_name") != "edge" for r in rows), (
                 "Picker must filter built-in name shadows even when the "
                 "registry has been bypassed."
             )
@@ -118,17 +125,21 @@ class TestPluginTTSProviders:
         tts_registry.register_provider(_ExplodingSchema(name="exploding"))
         tts_registry.register_provider(_FakeTTSProvider(name="working"))
         rows = tools_config._plugin_tts_providers()
-        assert [r["tts_plugin_name"] for r in rows] == ["working"]
+        names = [r["tts_plugin_name"] for r in rows]
+        assert "working" in names
+        assert "exploding" not in names
 
     def test_minimal_schema_uses_display_name(self):
         """A provider with no setup_schema override gets a row built from
         ``display_name`` and ``name`` only."""
         tts_registry.register_provider(_FakeTTSProvider(name="minimal"))
         rows = tools_config._plugin_tts_providers()
-        assert len(rows) == 1
-        assert rows[0]["name"] == "Minimal"  # display_name default
-        assert rows[0]["tts_provider"] == "minimal"
-        assert rows[0]["env_vars"] == []
+        by_plugin = {r["tts_plugin_name"]: r for r in rows}
+        assert "minimal" in by_plugin
+        row = by_plugin["minimal"]
+        assert row["name"] == "Minimal"  # display_name default
+        assert row["tts_provider"] == "minimal"
+        assert row["env_vars"] == []
 
     def test_post_setup_passthrough(self):
         tts_registry.register_provider(
@@ -142,7 +153,8 @@ class TestPluginTTSProviders:
             )
         )
         rows = tools_config._plugin_tts_providers()
-        assert rows[0].get("post_setup") == "my_post_install_hook"
+        by_plugin = {r["tts_plugin_name"]: r for r in rows}
+        assert by_plugin["my-tts"].get("post_setup") == "my_post_install_hook"
 
 
 class TestVisibleProvidersInjectsTTSPlugins:
@@ -162,9 +174,10 @@ class TestVisibleProvidersInjectsTTSPlugins:
         assert "Cartesia" in names
 
         # Plugin row has tts_provider key for write-path compat
-        plugin_rows = [r for r in visible if r.get("tts_plugin_name")]
-        assert len(plugin_rows) == 1
-        assert plugin_rows[0]["tts_provider"] == "cartesia"
+        plugin_rows = {
+            r["tts_plugin_name"]: r for r in visible if r.get("tts_plugin_name")
+        }
+        assert plugin_rows["cartesia"]["tts_provider"] == "cartesia"
 
     def test_other_categories_unaffected_by_tts_plugins(self):
         """Registering a TTS plugin must not leak into the Image Generation
@@ -176,12 +189,19 @@ class TestVisibleProvidersInjectsTTSPlugins:
         names = [row.get("name") for row in visible]
         assert "Cartesia" not in names
 
-    def test_tts_category_without_plugins_only_hardcoded(self):
-        """No plugins → picker shows exactly the hardcoded rows."""
+    def test_tts_category_default_rows(self):
+        """No user plugins → exactly the hardcoded rows plus the bundled
+        gradium plugin row."""
+        from hermes_cli.plugins import _ensure_plugins_discovered
+
+        _ensure_plugins_discovered(force=True)
         tts_cat = tools_config.TOOL_CATEGORIES["tts"]
         visible = tools_config._visible_providers(tts_cat, config={})
         names = [row.get("name") for row in visible]
-        # No row has the plugin marker
-        assert all(not row.get("tts_plugin_name") for row in visible)
+        # Only bundled plugin rows carry the plugin marker
+        plugin_names = [
+            row["tts_plugin_name"] for row in visible if row.get("tts_plugin_name")
+        ]
+        assert plugin_names == ["gradium"]
         # Hardcoded rows still present (sample one of the always-visible ones)
         assert "Microsoft Edge TTS" in names

@@ -857,6 +857,19 @@ platform_toolsets:
 #     voice: "Kore"
 #     audio_tags: false
 #     persona_prompt_file: ""  # e.g. ~/.hermes/tts/radio-host.md
+#
+# Gradium (https://gradium.ai) ships as a bundled TTS plugin
+# (plugins/tts/gradium/). Select it with tts.provider: "gradium" and set
+# GRADIUM_API_KEY in ~/.hermes/.env. Resolution order when names collide:
+# built-in providers > tts.providers.<name> command providers > plugins.
+#
+# tts:
+#   provider: "gradium"
+#   output_format: "wav"       # wav | opus | pcm — Gradium has no mp3;
+#                              # mp3/flac requests are written as WAV
+#   gradium:
+#     voice_id: ""             # voice uid from GET /api/voices/ (see the
+#                              # `hermes tools` voice picker); empty = server default
 
 # =============================================================================
 # Voice Transcription (Speech-to-Text)
