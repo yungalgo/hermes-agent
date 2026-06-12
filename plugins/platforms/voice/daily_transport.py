@@ -1,0 +1,189 @@
+"""Daily WebRTC transport via daily-python virtual audio devices.
+
+Audio geometry (chosen to avoid resampling entirely — daily-python gives
+every virtual device its own sample_rate, verified against the installed
+SDK 0.29.1: Daily.create_microphone_device / create_speaker_device both
+take ``sample_rate``):
+  inbound  (caller -> STT): virtual SPEAKER device @ 24 kHz mono — matches
+           Gradium ASR "pcm" input. Read 1920 frames (80 ms) per blocking
+           read_frames() call; the device paces reads at real time.
+  outbound (TTS -> caller): virtual MICROPHONE device @ 48 kHz mono —
+           matches Gradium TTS output (3840-sample/80 ms chunks pass
+           through untouched). Blocking write_frames() paces playback;
+           barge-in drains the local queue and stops writing.
+
+daily-python allows ONE active virtual speaker per process (and the
+upstream demos treat the mic the same way), so devices are process-level
+singletons and the adapter enforces a single active call.
+
+API facts verified against the installed daily-python 0.29.1 and the
+upstream demos (demos/audio/wav_audio_send.py, wav_audio_receive.py):
+  - Daily.init(worker_threads=2, log_level=...) — no args required.
+  - create_microphone_device(device_name, sample_rate=16000, channels=1,
+    non_blocking=False); same signature for create_speaker_device.
+  - CallClient(event_handler=None);
+    join(meeting_url, meeting_token=None, client_settings=None,
+         completion=None) — completion(JoinData, CallClientError);
+    leave(completion=None) — completion(CallClientError);
+    update_subscription_profiles(profile_settings, completion=None).
+  - client_settings mic selection shape (wav_audio_send.py):
+    {"inputs": {"camera": False, "microphone":
+        {"isEnabled": True, "settings": {"deviceId": <name>}}}}
+  - VirtualMicrophoneDevice.write_frames(frames, completion=None) -> int;
+    VirtualSpeakerDevice.read_frames(num_frames, completion=None) ->
+    bytestring (empty when no frames were read).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import queue
+import threading
+import time
+from typing import Awaitable, Callable, Optional
+
+logger = logging.getLogger(__name__)
+
+MIC_DEVICE = "hermes-voice-mic"
+SPEAKER_DEVICE = "hermes-voice-speaker"
+MIC_RATE = 48000                # Gradium TTS output rate (passthrough)
+SPEAKER_RATE = 24000            # Gradium ASR "pcm" input rate
+IN_CHUNK_FRAMES = 1920          # 80 ms @ 24 kHz — one ASR chunk per read
+
+# Subscribe to participant microphones only (wav_audio_receive.py pattern);
+# video is never wanted on a voice call.
+_SUBSCRIPTION_PROFILES = {
+    "base": {"camera": "unsubscribed", "microphone": "subscribed"}
+}
+
+_init_lock = threading.Lock()
+_initialized = False
+_mic = None
+_speaker = None
+
+
+def _ensure_daily() -> None:
+    """Daily.init() + virtual device creation, once per process."""
+    global _initialized, _mic, _speaker
+    with _init_lock:
+        if _initialized:
+            return
+        from daily import Daily
+        Daily.init()
+        _mic = Daily.create_microphone_device(
+            MIC_DEVICE, sample_rate=MIC_RATE, channels=1)
+        _speaker = Daily.create_speaker_device(
+            SPEAKER_DEVICE, sample_rate=SPEAKER_RATE, channels=1)
+        Daily.select_speaker_device(SPEAKER_DEVICE)
+        _initialized = True
+
+
+class DailyTransport:
+    """One Daily call. on_audio_in(pcm) is scheduled onto *loop* for every
+    80 ms chunk of caller audio (s16le mono 24 kHz)."""
+
+    def __init__(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        on_audio_in: Callable[[bytes], Awaitable[None]],
+    ):
+        self._loop = loop
+        self._on_audio_in = on_audio_in
+        self._client = None
+        self._running = False
+        self._reader: Optional[threading.Thread] = None
+        self._writer: Optional[threading.Thread] = None
+        self._out_q: "queue.Queue[Optional[bytes]]" = queue.Queue()
+        self._joined = threading.Event()
+        self._join_error: Optional[str] = None
+
+    async def join(self, room_url: str, token: str, timeout: float = 15.0) -> None:
+        _ensure_daily()
+        from daily import CallClient
+        self._client = CallClient()
+        self._client.update_subscription_profiles(_SUBSCRIPTION_PROFILES)
+
+        def _on_join(data, error):
+            self._join_error = str(error) if error else None
+            self._joined.set()
+
+        self._client.join(
+            room_url,
+            meeting_token=token,
+            client_settings={
+                "inputs": {
+                    "camera": False,
+                    "microphone": {
+                        "isEnabled": True,
+                        "settings": {"deviceId": MIC_DEVICE},
+                    },
+                }
+            },
+            completion=_on_join,
+        )
+        await self._loop.run_in_executor(None, self._joined.wait, timeout)
+        if not self._joined.is_set():
+            self._client.release()
+            self._client = None
+            raise RuntimeError(f"Daily join timed out after {timeout}s")
+        if self._join_error:
+            self._client.release()
+            self._client = None
+            raise RuntimeError(f"Daily join failed: {self._join_error}")
+        self._running = True
+        self._reader = threading.Thread(
+            target=self._read_loop, name="voice-daily-reader", daemon=True)
+        self._writer = threading.Thread(
+            target=self._write_loop, name="voice-daily-writer", daemon=True)
+        self._reader.start()
+        self._writer.start()
+        logger.info("voice/daily: joined %s", room_url)
+
+    def _read_loop(self) -> None:
+        while self._running:
+            frames = _speaker.read_frames(IN_CHUNK_FRAMES)   # blocking 80 ms
+            if not frames:
+                # Empty reads happen at teardown / before audio flows; avoid
+                # a hot spin since only non-empty reads pace real time.
+                time.sleep(0.01)
+                continue
+            asyncio.run_coroutine_threadsafe(self._on_audio_in(frames), self._loop)
+
+    def _write_loop(self) -> None:
+        while self._running:
+            try:
+                chunk = self._out_q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if chunk is None:
+                continue
+            _mic.write_frames(chunk)                          # blocking, paces RT
+
+    async def send_audio(self, pcm: bytes) -> None:
+        """Queue agent speech (s16le mono 48 kHz) for the caller."""
+        self._out_q.put(pcm)
+
+    def clear_output(self) -> None:
+        """Barge-in: drop all queued (unplayed) agent audio."""
+        try:
+            while True:
+                self._out_q.get_nowait()
+        except queue.Empty:
+            pass
+
+    async def leave(self) -> None:
+        self._running = False
+        self.clear_output()
+        if self._client is not None:
+            done = threading.Event()
+            self._client.leave(completion=lambda _error: done.set())
+            await self._loop.run_in_executor(None, done.wait, 10.0)
+            self._client.release()
+            self._client = None
+        for worker in (self._reader, self._writer):
+            if worker is not None and worker.is_alive():
+                await self._loop.run_in_executor(None, worker.join, 2.0)
+        self._reader = None
+        self._writer = None
+        logger.info("voice/daily: left room")

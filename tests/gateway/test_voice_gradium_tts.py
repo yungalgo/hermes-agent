@@ -5,29 +5,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import importlib.util
 import json
 import sys
-from pathlib import Path
 
 import pytest
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+from tests.gateway._voice_module_loader import load_voice_module
 
-
-def _load(name: str):
-    mod_name = f"voice_plugin_{name}"
-    if mod_name in sys.modules:
-        return sys.modules[mod_name]
-    path = _REPO_ROOT / "plugins" / "platforms" / "voice" / f"{name}.py"
-    spec = importlib.util.spec_from_file_location(mod_name, path)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[mod_name] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
-gradium_tts = _load("gradium_tts")
+gradium_tts = load_voice_module("gradium_tts")
 
 # Live-verified (2026-06-12): the FIRST server message on every TTS socket is
 # a "ready" frame with this shape. Fixtures inject it on every connect so the
