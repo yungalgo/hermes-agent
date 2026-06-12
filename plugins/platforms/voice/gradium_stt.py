@@ -129,7 +129,12 @@ class GradiumSTT:
             return
         await self._session.send_audio(pcm)
 
-    async def flush(self) -> int:
+    async def flush(self) -> Optional[int]:
+        """Request a transcript flush. Returns the flush_id to await, or
+        None when no session is live (no ``flushed`` event will ever
+        arrive — callers pair flush waits with a timeout)."""
+        if self._session is None or self._session.closed:
+            return None
         return await self._session.flush()
 
     async def maybe_rotate(self, latest_step: Dict[str, Any]) -> None:

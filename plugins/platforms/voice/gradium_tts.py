@@ -103,7 +103,12 @@ class GradiumTTSTurn:
         await self.send_text(text + " <flush>")
 
     async def end(self) -> None:
-        """Signal end of turn text; wait for all audio to be delivered."""
+        """Signal end of turn text; wait for all audio to be delivered.
+
+        NOTE: this blocks until the server sends its final audio and
+        end_of_stream. Callers (the turn loop) should wrap this in
+        ``asyncio.wait_for`` so a stalled server can't hang the turn.
+        """
         if self._aborted:
             return
         try:

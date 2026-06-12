@@ -1614,7 +1614,7 @@ requires-dist = [
     { name = "boto3", marker = "extra == 'bedrock'", specifier = "==1.42.89" },
     { name = "brotlicffi", marker = "extra == 'messaging'", specifier = "==1.2.0.1" },
     { name = "croniter", specifier = "==6.0.0" },
-    { name = "daily-python", marker = "extra == 'voice-platform'", specifier = ">=0.19,<1.0" },
+    { name = "daily-python", marker = "extra == 'voice-platform'", specifier = ">=0.19,<0.32" },
     { name = "daytona", marker = "extra == 'daytona'", specifier = "==0.155.0" },
     { name = "debugpy", marker = "extra == 'dev'", specifier = "==1.8.20" },
     { name = "defusedxml", marker = "extra == 'wecom'", specifier = "==0.7.1" },

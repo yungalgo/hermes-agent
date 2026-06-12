@@ -154,7 +154,9 @@ voice = [
 voice-platform = [
   # Realtime voice platform plugin (plugins/platforms/voice).
   # daily-python: BSD-2 WebRTC transport SDK; needs glibc>=2.28 (image is trixie/2.41).
-  "daily-python>=0.19,<1.0",
+  # Pre-1.0, so bounded to the next minor band per CONTRIBUTING's ceiling rule
+  # (resolved 0.29.1 at pin time).
+  "daily-python>=0.19,<0.32",
   # websockets: Gradium streaming STT/TTS client sockets.
   "websockets>=15.0,<16",
 ]

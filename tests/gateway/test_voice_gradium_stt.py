@@ -29,6 +29,29 @@ def _load(name: str):
 
 gradium_stt = _load("gradium_stt")
 
+# Live-verified (2026-06-12): the FIRST server message on every ASR socket is
+# a "ready" frame with this shape. Fixtures inject it on every connect so the
+# client's tolerance of it is always under test.
+READY_MSG = {
+    "type": "ready",
+    "sample_rate": 24000,
+    "frame_size": 1920,
+    "delay_in_frames": 10,
+}
+
+# Live-verified: step.vad carries FOUR horizons (0.5/1.0/2.0/3.0). Fixtures
+# order them with 0.5 LAST so any index-0 lookup reads the wrong horizon and
+# fails the assertions below (lookups must be by horizon_s value).
+
+
+def _vad(p05: float, p10: float = 0.5, p20: float = 0.5, p30: float = 0.5):
+    return [
+        {"horizon_s": 1.0, "inactivity_prob": p10},
+        {"horizon_s": 2.0, "inactivity_prob": p20},
+        {"horizon_s": 3.0, "inactivity_prob": p30},
+        {"horizon_s": 0.5, "inactivity_prob": p05},
+    ]
+
 
 class FakeWS:
     def __init__(self):
@@ -59,6 +82,7 @@ def fake_ws(monkeypatch):
     async def fake_connect(url, additional_headers=None):
         ws.url = url
         ws.headers = additional_headers
+        ws.inbox.put_nowait(dict(READY_MSG))   # server greets every socket
         return ws
 
     fake_module = type(sys)("websockets")
@@ -94,10 +118,12 @@ async def test_no_rotation_before_threshold_or_during_speech(fake_ws):
     stt = gradium_stt.GradiumSTT("g-key")
     await stt.start()
     stt._session.total_duration_s = 100.0
-    await stt.maybe_rotate({"vad": [{"horizon_s": 0.5, "inactivity_prob": 0.99}]})
+    await stt.maybe_rotate({"vad": _vad(0.99, 0.99, 0.99, 0.99)})
     first = stt._session
     stt._session.total_duration_s = 250.0
-    await stt.maybe_rotate({"vad": [{"horizon_s": 0.5, "inactivity_prob": 0.1}]})
+    # 0.5s horizon says SPEAKING (0.1) while every other horizon is over the
+    # rotate threshold — an index-0 lookup would wrongly rotate here.
+    await stt.maybe_rotate({"vad": _vad(0.1, 0.95, 0.9, 0.9)})
     assert stt._session is first     # speaking: no rotate
     await stt.stop()
 
@@ -108,9 +134,9 @@ async def test_rotation_during_silence_past_threshold(fake_ws):
     await stt.start()
     first = stt._session
     first.total_duration_s = 250.0
-    await stt.maybe_rotate(
-        {"vad": [{"horizon_s": 0.5, "inactivity_prob": 0.95},
-                 {"horizon_s": 3.0, "inactivity_prob": 0.99}]})
+    # 0.5s horizon says SILENT (0.95) while vad[0] (1.0s horizon) is under the
+    # threshold — an index-0 lookup would wrongly skip this rotation.
+    await stt.maybe_rotate({"vad": _vad(0.95, 0.3, 0.4, 0.5)})
     assert stt._session is not first
     assert first.closed is True
     await stt.stop()
@@ -121,12 +147,26 @@ async def test_events_yields_server_messages(fake_ws):
     stt = gradium_stt.GradiumSTT("g-key")
     await stt.start()
     await fake_ws.inbox.put(
-        {"type": "step", "vad": [], "total_duration_s": 0.08})
+        {"type": "step", "vad": _vad(0.2), "total_duration_s": 0.08})
     await fake_ws.inbox.put({"type": "text", "text": "hi", "start_s": 0.0})
     events = stt.events()
+    # The leading server "ready" frame passes through without breaking the
+    # client; downstream consumers ignore unknown types.
     first = await asyncio.wait_for(events.__anext__(), timeout=2)
     second = await asyncio.wait_for(events.__anext__(), timeout=2)
-    assert first["type"] == "step"
+    third = await asyncio.wait_for(events.__anext__(), timeout=2)
+    assert first == READY_MSG
+    assert second["type"] == "step"
     assert stt._session.total_duration_s == 0.08
-    assert second == {"type": "text", "text": "hi", "start_s": 0.0}
+    assert third == {"type": "text", "text": "hi", "start_s": 0.0}
     await stt.stop()
+
+
+@pytest.mark.asyncio
+async def test_flush_noop_without_live_session(fake_ws):
+    stt = gradium_stt.GradiumSTT("g-key")
+    assert await stt.flush() is None        # never started
+    await stt.start()
+    assert await stt.flush() == 1
+    await stt.stop()
+    assert await stt.flush() is None        # closed

@@ -29,6 +29,11 @@ def _load(name: str):
 
 gradium_tts = _load("gradium_tts")
 
+# Live-verified (2026-06-12): the FIRST server message on every TTS socket is
+# a "ready" frame with this shape. Fixtures inject it on every connect so the
+# client's tolerance of it is always under test.
+READY_MSG = {"type": "ready", "sample_rate": 48000, "frame_size": 3840}
+
 
 class FakeWS:
     def __init__(self):
@@ -59,6 +64,7 @@ def fake_ws(monkeypatch):
     async def fake_connect(url, additional_headers=None):
         ws.url = url
         ws.headers = additional_headers
+        ws.inbox.put_nowait(dict(READY_MSG))   # server greets every socket
         return ws
 
     fake_module = type(sys)("websockets")
