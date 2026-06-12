@@ -172,6 +172,45 @@ async def test_flush_ids_monotonic_across_rotation(fake_ws):
 
 
 @pytest.mark.asyncio
+async def test_watchdog_reconnects_dead_session(fake_ws, monkeypatch):
+    """A session whose socket dies (e.g. the server's 300s wall-clock kill,
+    observed live 2026-06-12) must be replaced automatically — without it
+    the call goes permanently deaf."""
+    monkeypatch.setattr(gradium_stt, "WATCHDOG_INTERVAL_S", 0.05)
+    stt = gradium_stt.GradiumSTT("g-key")
+    await stt.start()
+    first = stt._session
+    fake_ws.inbox.put_nowait(None)      # server closes: recv loop exits
+    for _ in range(100):
+        await asyncio.sleep(0.02)
+        if stt._session is not first:
+            break
+    assert stt._session is not first
+    assert first.closed is True
+    await stt.stop()
+
+
+@pytest.mark.asyncio
+async def test_watchdog_rotates_on_wall_clock_age_without_steps(fake_ws, monkeypatch):
+    """The server kills sessions on WALL CLOCK; maybe_rotate only sees step
+    events (audio inflow). With no audio at all, the watchdog must still
+    rotate before the kill."""
+    monkeypatch.setattr(gradium_stt, "WATCHDOG_INTERVAL_S", 0.05)
+    monkeypatch.setattr(gradium_stt, "HARD_ROTATE_AFTER_S", 0.1)
+    stt = gradium_stt.GradiumSTT("g-key")
+    await stt.start()
+    first = stt._session
+    assert first.total_duration_s == 0.0    # no audio was ever processed
+    for _ in range(100):
+        await asyncio.sleep(0.02)
+        if stt._session is not first:
+            break
+    assert stt._session is not first
+    assert first.closed is True
+    await stt.stop()
+
+
+@pytest.mark.asyncio
 async def test_flush_noop_without_live_session(fake_ws):
     stt = gradium_stt.GradiumSTT("g-key")
     assert await stt.flush() is None        # never started

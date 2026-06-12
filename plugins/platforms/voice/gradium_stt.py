@@ -26,6 +26,7 @@ import asyncio
 import base64
 import json
 import logging
+import time
 from typing import Any, AsyncIterator, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -35,6 +36,14 @@ SAMPLE_RATE = 24000          # "pcm" input_format default
 CHUNK_SAMPLES = 1920         # 80 ms
 ROTATE_AFTER_S = 240.0       # rotate well before the 300s session cap
 SILENCE_PROB_FOR_ROTATE = 0.8  # horizon-0.5 inactivity required to rotate
+# The server kills sessions at 300s of WALL CLOCK, not processed audio.
+# maybe_rotate only runs on step events (which require audio inflow), so a
+# call with no inbound audio (empty room, muted caller) would die silently
+# at 300s (observed live 2026-06-12: 1008 "Session exceeded maximum
+# duration"). The watchdog force-rotates on wall-clock age and reconnects
+# a session whose socket died.
+HARD_ROTATE_AFTER_S = 270.0
+WATCHDOG_INTERVAL_S = 5.0
 
 
 class _Session:
@@ -59,6 +68,13 @@ class _Session:
         self._next_flush_id = next_flush_id
         self.total_duration_s = 0.0
         self.closed = False
+        self.opened_at = 0.0
+
+    @property
+    def dead(self) -> bool:
+        """Socket gone without close(): the recv loop has exited."""
+        return (not self.closed and self._recv_task is not None
+                and self._recv_task.done())
 
     async def open(self) -> None:
         import websockets
@@ -68,6 +84,7 @@ class _Session:
         await self._ws.send(json.dumps(
             {"type": "setup", "model_name": "default", "input_format": "pcm"}
         ))
+        self.opened_at = time.monotonic()
         self._recv_task = asyncio.create_task(self._recv_loop())
 
     async def _recv_loop(self) -> None:
@@ -130,6 +147,7 @@ class GradiumSTT:
         self._events: "asyncio.Queue[Dict[str, Any]]" = asyncio.Queue()
         self._session: Optional[_Session] = None
         self._rotating = False
+        self._watchdog: Optional[asyncio.Task] = None
         # Call-scoped flush counter: monotonic across session rotations so a
         # flush id is never reused and stale acks can never match a new wait.
         self._flush_seq = 0
@@ -141,6 +159,43 @@ class GradiumSTT:
     async def start(self) -> None:
         self._session = _Session(self._api_key, self._events, self._next_flush_id)
         await self._session.open()
+        self._watchdog = asyncio.create_task(self._watch())
+
+    async def _watch(self) -> None:
+        """Wall-clock session keeper: reconnect dead sessions, force-rotate
+        before the server's 300s wall-clock kill (which maybe_rotate cannot
+        see when no audio is flowing)."""
+        while True:
+            await asyncio.sleep(WATCHDOG_INTERVAL_S)
+            try:
+                s = self._session
+                if s is None or self._rotating:
+                    continue
+                if s.dead:
+                    logger.warning("voice/stt: session died; reconnecting")
+                    await self._replace_session(s)
+                elif time.monotonic() - s.opened_at > HARD_ROTATE_AFTER_S:
+                    logger.info(
+                        "voice/stt: wall-clock rotation at %.0fs session age",
+                        time.monotonic() - s.opened_at)
+                    await self._replace_session(s)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning("voice/stt: watchdog error: %s", e)
+
+    async def _replace_session(self, old: "_Session") -> None:
+        """Open a fresh session, then close the old one (overlap, no gap)."""
+        if self._rotating:
+            return
+        self._rotating = True
+        try:
+            fresh = _Session(self._api_key, self._events, self._next_flush_id)
+            await fresh.open()
+            self._session = fresh
+            await old.close()
+        finally:
+            self._rotating = False
 
     async def send_audio(self, pcm: bytes) -> None:
         if self._session is None or self._session.closed:
@@ -166,16 +221,9 @@ class GradiumSTT:
                  for v in latest_step.get("vad", [])}
         if probs.get(0.5, 0.0) < SILENCE_PROB_FOR_ROTATE:
             return
-        self._rotating = True
         old = self._session
-        try:
-            fresh = _Session(self._api_key, self._events, self._next_flush_id)
-            await fresh.open()                 # overlap: new socket live first
-            self._session = fresh
-            await old.close()
-            logger.info("voice/stt: rotated session at %.0fs", old.total_duration_s)
-        finally:
-            self._rotating = False
+        await self._replace_session(old)       # overlap: new socket live first
+        logger.info("voice/stt: rotated session at %.0fs", old.total_duration_s)
 
     async def events(self) -> AsyncIterator[Dict[str, Any]]:
         while True:
@@ -183,5 +231,12 @@ class GradiumSTT:
             yield msg
 
     async def stop(self) -> None:
+        if self._watchdog is not None:
+            self._watchdog.cancel()
+            try:
+                await self._watchdog
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._watchdog = None
         if self._session is not None:
             await self._session.close()
