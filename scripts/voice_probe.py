@@ -66,6 +66,61 @@ RMS_SPEECH = 300            # s16 RMS above this counts as agent speech
 # substantive gap (~3.1s measured) or the probe mistakes the vamp clip for
 # the whole reply and the NEXT run collides with the late substantive audio.
 REPLY_END_SILENCE_S = 4.0
+
+# Verify run 2026-06-12: a vamp ack clip followed by the (3.9-4.3s)
+# vamp->substantive gap was mistaken for a completed reply, colliding the
+# probe's next utterance with the late substantive audio. The reply-end wait
+# is now a classifier: short (vamp-length) audio followed by silence stays
+# "vamp-gap" (still waiting) until substantive audio arrives or a hard
+# timeout passes.
+VAMP_MAX_S = 2.0            # speech runs at/below this are vamp-length
+VAMP_GAP_TIMEOUT_S = 6.0    # vamp with nothing behind it = the whole reply
+RUN_BREAK_S = 0.25          # silence gap that splits speech runs
+
+
+def _speech_runs(samples, t_start):
+    """Contiguous speech runs [(t_first, t_last), ...] at/after t_start."""
+    speech = sorted(t for t, rms in samples if t >= t_start and rms > RMS_SPEECH)
+    runs = []
+    for t in speech:
+        if runs and t - runs[-1][1] <= RUN_BREAK_S:
+            runs[-1][1] = t
+        else:
+            runs.append([t, t])
+    return [(a, b) for a, b in runs]
+
+
+def reply_end_state(samples, t_start, now):
+    """Classify the reply window: ("waiting"|"vamp-gap"|"done", t_last_speech).
+
+    - no speech yet            -> ("waiting", None)
+    - substantive speech seen  -> "done" after REPLY_END_SILENCE_S of quiet
+    - only vamp-length speech  -> "vamp-gap" once quiet exceeds
+      REPLY_END_SILENCE_S (keep waiting for the real reply), "done" only
+      after VAMP_GAP_TIMEOUT_S (the ack WAS the whole reply).
+    """
+    runs = _speech_runs(samples, t_start)
+    if not runs:
+        return ("waiting", None)
+    last = runs[-1][1]
+    silence = now - last
+    substantive = any(b - a + CHUNK_S > VAMP_MAX_S for a, b in runs)
+    if substantive:
+        return ("done", last) if silence >= REPLY_END_SILENCE_S else ("waiting", last)
+    if silence >= VAMP_GAP_TIMEOUT_S:
+        return ("done", last)
+    if silence >= REPLY_END_SILENCE_S:
+        return ("vamp-gap", last)
+    return ("waiting", last)
+
+
+def first_substantive_start(samples, t_start):
+    """Start time of the first speech run longer than vamp-length, or None."""
+    for a, b in _speech_runs(samples, t_start):
+        if b - a + CHUNK_S > VAMP_MAX_S:
+            return a
+    return None
+
 DAILY_API = "https://api.daily.co/v1"
 
 MIC = "probe-mic"
@@ -226,14 +281,14 @@ class Probe:
         return None
 
     def wait_reply_end(self, t_start: float, timeout: float = 60.0):
-        """Return the time of the last speech-level chunk once
-        REPLY_END_SILENCE_S of quiet has followed it."""
+        """Return the time of the last speech-level chunk once the reply-end
+        classifier says the reply is done (vamp-aware; see reply_end_state)."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            speech = [t for t, rms in self._snapshot()
-                      if t >= t_start and rms > RMS_SPEECH]
-            if speech and time.monotonic() - speech[-1] > REPLY_END_SILENCE_S:
-                return speech[-1]
+            state, t_last = reply_end_state(
+                self._snapshot(), t_start, time.monotonic())
+            if state == "done":
+                return t_last
             time.sleep(0.05)
         return None
 
