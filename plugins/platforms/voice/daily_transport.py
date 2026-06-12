@@ -94,9 +94,11 @@ class DailyTransport:
         self._running = False
         self._reader: Optional[threading.Thread] = None
         self._writer: Optional[threading.Thread] = None
+        self._keepalive: Optional[threading.Thread] = None
         self._out_q: "queue.Queue[Optional[bytes]]" = queue.Queue()
         self._joined = threading.Event()
         self._join_error: Optional[str] = None
+        self._last_audio_in_t = 0.0
 
     async def join(self, room_url: str, token: str, timeout: float = 15.0) -> None:
         _ensure_daily()
@@ -132,12 +134,17 @@ class DailyTransport:
             self._client = None
             raise RuntimeError(f"Daily join failed: {self._join_error}")
         self._running = True
+        self._last_audio_in_t = time.monotonic()
         self._reader = threading.Thread(
             target=self._read_loop, name="voice-daily-reader", daemon=True)
         self._writer = threading.Thread(
             target=self._write_loop, name="voice-daily-writer", daemon=True)
+        self._keepalive = threading.Thread(
+            target=self._keepalive_loop, name="voice-daily-keepalive",
+            daemon=True)
         self._reader.start()
         self._writer.start()
+        self._keepalive.start()
         logger.info("voice/daily: joined %s", room_url)
 
     def _read_loop(self) -> None:
@@ -148,7 +155,25 @@ class DailyTransport:
                 # a hot spin since only non-empty reads pace real time.
                 time.sleep(0.01)
                 continue
+            self._last_audio_in_t = time.monotonic()
             asyncio.run_coroutine_threadsafe(self._on_audio_in(frames), self._loop)
+
+    def _keepalive_loop(self) -> None:
+        # WebRTC DTX: a silent caller stops sending packets entirely and
+        # read_frames() BLOCKS (it cannot be relied on to return empties at
+        # cadence). Gradium's streaming ASR/VAD assumes a continuous
+        # timeline — starving it produces wildly oscillating VAD
+        # probabilities (observed live 2026-06-12: false barge-ins,
+        # end-of-turn never firing, sparse step events). This thread feeds
+        # synthesized 80ms silence whenever real audio stops flowing.
+        silence = b"\x00" * (IN_CHUNK_FRAMES * 2)
+        while self._running:
+            time.sleep(0.08)
+            if not self._running:
+                return
+            if time.monotonic() - self._last_audio_in_t >= 0.16:
+                asyncio.run_coroutine_threadsafe(
+                    self._on_audio_in(silence), self._loop)
 
     def _write_loop(self) -> None:
         # Pacing diagnosis: track audio-seconds written vs wall-clock since
@@ -212,9 +237,10 @@ class DailyTransport:
             await self._loop.run_in_executor(None, done.wait, 10.0)
             self._client.release()
             self._client = None
-        for worker in (self._reader, self._writer):
+        for worker in (self._reader, self._writer, self._keepalive):
             if worker is not None and worker.is_alive():
                 await self._loop.run_in_executor(None, worker.join, 2.0)
         self._reader = None
         self._writer = None
+        self._keepalive = None
         logger.info("voice/daily: left room")

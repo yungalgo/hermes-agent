@@ -233,7 +233,33 @@ async def test_read_loop_forwards_frames_to_on_audio_in(fake_daily):
         spk = fake_daily.speakers[0]
         spk.frames_q.put(b"\x0a" * 16)
         spk.frames_q.put(b"\x0b" * 16)
-        await _eventually(lambda: received == [b"\x0a" * 16, b"\x0b" * 16])
+        # Real frames arrive in order; DTX keep-alive silence (all-zero
+        # chunks) may interleave when the queue runs dry.
+        await _eventually(
+            lambda: [c for c in received if any(c)] == [b"\x0a" * 16,
+                                                        b"\x0b" * 16])
+    finally:
+        await transport.leave()
+
+
+@pytest.mark.asyncio
+async def test_read_loop_feeds_silence_during_dtx_gaps(fake_daily):
+    """A silent caller (WebRTC DTX) must not starve the ASR stream: the
+    reader synthesizes 80ms silence chunks at cadence while read_frames
+    returns nothing."""
+    received = []
+
+    async def on_audio_in(pcm: bytes) -> None:
+        received.append(pcm)
+
+    transport = _make_transport(on_audio_in)
+    await transport.join("https://x.daily.co/room", "tok-1")
+    try:
+        # No frames pushed at all — only keep-alive silence should flow.
+        await _eventually(lambda: len(received) >= 3, timeout=3.0)
+        assert all(not any(c) for c in received)
+        assert all(len(c) == daily_transport.IN_CHUNK_FRAMES * 2
+                   for c in received)
     finally:
         await transport.leave()
 
