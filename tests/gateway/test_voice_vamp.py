@@ -403,6 +403,223 @@ async def test_no_vamp_cache_means_no_vamp(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Energy-trigger dual-confirm (VAD-step veto) + retry window
+#
+# Verify run 2026-06-12: the one-shot `==` trigger MISSED 1/3 clean turns
+# (perceived first audio blew out to ~3.9s) and FALSE-FIRED once during a
+# mid-utterance pause (turn 8). The trigger now (a) retries across a
+# bounded window instead of firing on exactly the Nth quiet chunk, (b) is
+# vetoed by a fresh speech-positive VAD step (semantic VAD keeps the
+# short-horizon inactivity LOW through an intra-utterance pause), and
+# (c) catches up on any silence-confirming step — including vad-end.
+# ---------------------------------------------------------------------------
+
+
+def push_short_quiet_step(stt, p=0.8):
+    """Step whose SHORT horizon confirms silence but whose end-of-turn
+    (2.0s) horizon does not fire — silence just began."""
+    stt.push({"type": "step", "total_duration_s": 1.0, "vad": [
+        {"horizon_s": 0.5, "inactivity_prob": p},
+        {"horizon_s": 1.0, "inactivity_prob": 0.3},
+        {"horizon_s": 2.0, "inactivity_prob": 0.1},
+        {"horizon_s": 3.0, "inactivity_prob": 0.1},
+    ]})
+
+
+@pytest.mark.asyncio
+async def test_energy_fire_retries_when_clips_become_ready_late(monkeypatch):
+    """Miss mode 1 (verify run): clips not ready at the exact Nth quiet
+    chunk used to skip the vamp FOR THE WHOLE TURN. The fire window now
+    retries on later quiet chunks."""
+    install_agents(monkeypatch, [say(GREETING_REPLY)])
+    stt, factory = FakeSTT(), FakeTTSFactory()
+    transport = MarkedTransport()
+    vamp = FakeVamp(ready=False)
+    vloop = _make_loop(stt, factory, transport, vamp=vamp)
+    task = asyncio.create_task(vloop.run())
+    try:
+        await _await_listening_after_greeting(vloop)
+        for _ in range(2):
+            await vloop.on_inbound_audio(LOUD_CHUNK)
+        for _ in range(3):
+            await vloop.on_inbound_audio(QUIET_CHUNK)
+        assert vamp.picks == []              # skipped: clips not ready
+        vamp._ready = True
+        await vloop.on_inbound_audio(QUIET_CHUNK)   # 4th chunk: retry fires
+        assert vamp.picks == ["Right."]
+    finally:
+        await vloop.stop()
+        await task
+
+
+@pytest.mark.asyncio
+async def test_speech_step_vetoes_energy_fire_until_vad_confirms(monkeypatch):
+    """Dual-confirm: a fresh speech-positive VAD step blocks the energy
+    fire (the user is mid-utterance); the fire happens the moment a
+    silence-confirming step lands."""
+    install_agents(monkeypatch, [say(GREETING_REPLY)])
+    stt, factory = FakeSTT(), FakeTTSFactory()
+    transport = MarkedTransport()
+    vamp = FakeVamp()
+    vloop = _make_loop(stt, factory, transport, vamp=vamp)
+    task = asyncio.create_task(vloop.run())
+    try:
+        await _await_listening_after_greeting(vloop)
+        for _ in range(2):
+            await vloop.on_inbound_audio(LOUD_CHUNK)
+        stt.push_speech_step()
+        await _eventually(lambda: vloop._last_step_speech_t is not None)
+        for _ in range(5):
+            await vloop.on_inbound_audio(QUIET_CHUNK)
+        assert vamp.picks == []              # vetoed, not fired
+        assert vloop._vamp_veto_deferred >= 1
+        push_short_quiet_step(stt)           # VAD confirms silence
+        await _eventually(lambda: vamp.picks == ["Right."])
+        assert transport.chunks[:2] == [CLIP_PCM[:7680], CLIP_PCM[7680:]]
+    finally:
+        await vloop.stop()
+        await task
+
+
+@pytest.mark.asyncio
+async def test_stale_speech_step_cannot_veto(monkeypatch):
+    """The veto rides the STT round-trip; a stale speech step (older than
+    VAMP_VETO_FRESH_S) must not block the energy fire — a stalled stream
+    can only delay the vamp by the freshness window."""
+    install_agents(monkeypatch, [say(GREETING_REPLY)])
+    monkeypatch.setattr(turn_loop, "VAMP_VETO_FRESH_S", 0.05)
+    stt, factory = FakeSTT(), FakeTTSFactory()
+    transport = MarkedTransport()
+    vamp = FakeVamp()
+    vloop = _make_loop(stt, factory, transport, vamp=vamp)
+    task = asyncio.create_task(vloop.run())
+    try:
+        await _await_listening_after_greeting(vloop)
+        for _ in range(2):
+            await vloop.on_inbound_audio(LOUD_CHUNK)
+        stt.push_speech_step()
+        await _eventually(lambda: vloop._last_step_speech_t is not None)
+        await asyncio.sleep(0.12)            # veto goes stale
+        for _ in range(3):
+            await vloop.on_inbound_audio(QUIET_CHUNK)
+        assert vamp.picks == ["Right."]
+    finally:
+        await vloop.stop()
+        await task
+
+
+@pytest.mark.asyncio
+async def test_mid_utterance_pause_does_not_false_fire(monkeypatch, caplog):
+    """The turn-8 false fire (verify run): a ~240ms intra-utterance pause
+    with semantic VAD still speech-positive. The veto holds through the
+    pause; the vamp fires exactly once at the REAL end of the utterance."""
+    agents = install_agents(monkeypatch, [
+        say(GREETING_REPLY), say("Answer to the full question.")])
+    stt, factory = FakeSTT(), FakeTTSFactory()
+    transport = MarkedTransport()
+    vamp = FakeVamp()
+    vloop = _make_loop(stt, factory, transport, vamp=vamp)
+    task = asyncio.create_task(vloop.run())
+    try:
+        await _await_listening_after_greeting(vloop)
+        caplog.set_level("INFO", logger=turn_loop.__name__)
+        # First clause, then a pause with VAD still saying SPEECH.
+        for _ in range(2):
+            await vloop.on_inbound_audio(LOUD_CHUNK)
+        stt.push_speech_step()
+        await _eventually(lambda: vloop._last_step_speech_t is not None)
+        for _ in range(4):
+            await vloop.on_inbound_audio(QUIET_CHUNK)
+        assert vamp.picks == []              # the old trigger fired HERE
+        # The user resumes (no clip is playing, so no cancel needed).
+        for _ in range(3):
+            await vloop.on_inbound_audio(LOUD_CHUNK)
+        stt.push_speech_step()
+        await asyncio.sleep(0.02)
+        # Real end of turn: energy silence + VAD confirmation.
+        for _ in range(3):
+            await vloop.on_inbound_audio(QUIET_CHUNK)
+        assert vamp.picks == []              # still vetoed (fresh speech step)
+        push_short_quiet_step(stt)
+        await _eventually(lambda: vamp.picks == ["Right."])
+        stt.push_text("the full question?")
+        stt.push_end_of_turn_step()
+        await _eventually(lambda: len(vloop._history) == 3)
+        recs = [r for r in _telemetry_records(caplog)
+                if r["event"] == "voice_turn" and r["vamp"]["fired"]]
+        assert recs and recs[0]["vamp"]["false_fire"] is False
+        assert len(vamp.picks) == 1
+    finally:
+        await vloop.stop()
+        await task
+
+
+@pytest.mark.asyncio
+async def test_vad_end_step_catches_up_a_vetoed_fire(monkeypatch, caplog):
+    """Miss mode 2: if the veto held all the way to vad-end, the
+    end-of-turn step itself confirms silence and fires the vamp before
+    the turn starts — the vamp can be late, never absent."""
+    install_agents(monkeypatch, [
+        say(GREETING_REPLY), say("The substantive answer.")])
+    stt, factory = FakeSTT(), FakeTTSFactory()
+    transport = MarkedTransport()
+    vamp = FakeVamp()
+    vloop = _make_loop(stt, factory, transport, vamp=vamp)
+    task = asyncio.create_task(vloop.run())
+    try:
+        await _await_listening_after_greeting(vloop)
+        caplog.set_level("INFO", logger=turn_loop.__name__)
+        for _ in range(2):
+            await vloop.on_inbound_audio(LOUD_CHUNK)
+        stt.push_speech_step()
+        await _eventually(lambda: vloop._last_step_speech_t is not None)
+        for _ in range(4):
+            await vloop.on_inbound_audio(QUIET_CHUNK)
+        assert vamp.picks == []              # vetoed
+        stt.push_text("what time is it")
+        stt.push_end_of_turn_step()          # confirms silence AND ends turn
+        await _eventually(lambda: vamp.picks == ["Right."])
+        await _eventually(lambda: len(vloop._history) == 3)
+        recs = [r for r in _telemetry_records(caplog)
+                if r["event"] == "voice_turn" and r["vad_end_ms"] is not None]
+        assert recs and recs[0]["vamp"]["fired"] is True
+        assert recs[0]["vamp"]["trigger"] == "energy"
+    finally:
+        await vloop.stop()
+        await task
+
+
+@pytest.mark.asyncio
+async def test_fire_window_bounded(monkeypatch):
+    """Past VAMP_ENERGY_MAX_SILENCE_CHUNKS the vamp stays silent: that
+    deep into the silence the vad-end path owns the turn, and a clip
+    landing seconds after the user stopped would read as a non sequitur."""
+    install_agents(monkeypatch, [say(GREETING_REPLY)])
+    stt, factory = FakeSTT(), FakeTTSFactory()
+    transport = MarkedTransport()
+    vamp = FakeVamp()
+    vloop = _make_loop(stt, factory, transport, vamp=vamp)
+    task = asyncio.create_task(vloop.run())
+    try:
+        await _await_listening_after_greeting(vloop)
+        for _ in range(2):
+            await vloop.on_inbound_audio(LOUD_CHUNK)
+        stt.push_speech_step()
+        await _eventually(lambda: vloop._last_step_speech_t is not None)
+        for _ in range(turn_loop.VAMP_ENERGY_MAX_SILENCE_CHUNKS + 1):
+            await vloop.on_inbound_audio(QUIET_CHUNK)
+        assert vamp.picks == []              # vetoed through the window
+        push_short_quiet_step(stt)           # confirmation arrives too late
+        await asyncio.sleep(0.1)
+        assert vamp.picks == []
+        await vloop.on_inbound_audio(QUIET_CHUNK)
+        assert vamp.picks == []
+    finally:
+        await vloop.stop()
+        await task
+
+
+# ---------------------------------------------------------------------------
 # Telemetry shape (§16)
 # ---------------------------------------------------------------------------
 

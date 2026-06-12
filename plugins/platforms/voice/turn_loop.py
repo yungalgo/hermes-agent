@@ -74,9 +74,16 @@ ENERGY_BARGE_CHUNKS = 2
 # Vamp (perceived-latency acknowledgment clips, notes §16): fired on a
 # FAST end-of-turn signal, before the (slow, ~550ms) vad-end confirmation.
 # Two trigger designs, selectable via extra.vamp_trigger:
-#   energy: N consecutive quiet 80ms inbound chunks after >=M hot chunks
-#           (the inverse of the energy barge-in trigger). Available
-#           instantly; fires N*80ms after the user stops.
+#   energy: quiet 80ms inbound chunks after >=M hot chunks (the inverse
+#           of the energy barge-in trigger), DUAL-CONFIRMED against the
+#           short-horizon VAD: a fresh speech-positive step vetoes the
+#           fire (semantic VAD keeps short-horizon inactivity LOW through
+#           an intra-utterance pause — verify run 2026-06-12 false fire,
+#           turn 8), and any silence-confirming step — including the
+#           vad-end step itself — fires a deferred vamp immediately. The
+#           fire window RETRIES (>=, bounded) instead of one-shotting on
+#           the exact Nth chunk (verify run miss: 1/3 clean turns lost
+#           the vamp and perceived first-audio blew out to ~3.9s).
 #   vad:    first short-horizon VAD crossing (0.5s inactivity_prob rising
 #           through VAMP_VAD_PROB) — semantically smarter, but rides the
 #           STT round-trip.
@@ -84,6 +91,20 @@ VAMP_TRIGGERS = ("energy", "vad", "off")
 DEFAULT_VAMP_TRIGGER = "energy"
 VAMP_ENERGY_SILENCE_CHUNKS = 3      # 240ms of quiet after speech
 VAMP_ENERGY_MIN_SPEECH_CHUNKS = 2   # >=160ms of speech before quiet counts
+# Upper edge of the energy fire window: ~960ms after silence onset the
+# vad-end path (~550-760ms live) owns the turn, and a clip landing seconds
+# late reads as a non sequitur. Also bounds retry attempts/log volume.
+VAMP_ENERGY_MAX_SILENCE_CHUNKS = 12
+# Dual-confirm thresholds on the 0.5s-horizon inactivity probability:
+# <= SPEECH_PROB the step asserts the user is mid-utterance (veto);
+# >= CLEAR_PROB it confirms silence (fires a deferred vamp). Between the
+# two the step is ambiguous and the last assertion stands.
+VAMP_VETO_SPEECH_PROB = 0.5
+VAMP_VETO_CLEAR_PROB = 0.6
+# A speech-positive step older than this cannot veto: steps ride the STT
+# round-trip, and a DEAF/stalled stream must only be able to delay the
+# vamp by this bound, never suppress it (the miss rate is the metric).
+VAMP_VETO_FRESH_S = 0.4
 VAMP_VAD_HORIZON = 0.5
 VAMP_VAD_PROB = 0.7
 # False-fire recovery: the user resuming speech while the vamp clip is
@@ -242,6 +263,13 @@ class VoiceTurnLoop:
         self._utt_hot_chunks = 0
         self._utt_quiet_chunks = 0
         self._last_hot_t: Optional[float] = None
+        # Dual-confirm veto state (energy trigger): receipt times of the
+        # latest speech-asserting / silence-confirming short-horizon VAD
+        # steps, plus a per-cycle count of quiet chunks the veto deferred
+        # (telemetry: deferred*80ms = latency the veto added).
+        self._last_step_speech_t: Optional[float] = None
+        self._last_step_quiet_t: Optional[float] = None
+        self._vamp_veto_deferred = 0
         self._energy_barge_chunks = _resolve_int_extra(
             self._extra, "barge_energy_chunks", ENERGY_BARGE_CHUNKS)
         # Telemetry (notes §16): one structured record per turn cycle,
@@ -349,6 +377,7 @@ class VoiceTurnLoop:
                 "trigger": tel.get("vamp_trigger"),
                 "text": tel.get("vamp_text"),
                 "false_fire": bool(tel.get("vamp_false_fire")),
+                "veto_deferred_chunks": self._vamp_veto_deferred,
             },
             "totals": {
                 "perceived_first_audio_ms": perceived,
@@ -356,6 +385,7 @@ class VoiceTurnLoop:
                 "turn_total_ms": off(time.monotonic()),
             },
         }
+        self._vamp_veto_deferred = 0
         logger.info("voice/telemetry %s", json.dumps(record))
         self._call_stats.append(record)
 
@@ -559,9 +589,28 @@ class VoiceTurnLoop:
         self._vamp_resume_hot = 0
         if self._utt_hot_chunks >= self._vamp_min_speech:
             self._utt_quiet_chunks += 1
-            if (self._vamp_trigger == "energy"
-                    and self._utt_quiet_chunks == self._vamp_silence_chunks):
-                await self._fire_vamp("energy")
+            if self._vamp_energy_in_window():
+                if self._vamp_step_veto_active(now):
+                    self._vamp_veto_deferred += 1
+                else:
+                    await self._fire_vamp("energy")
+
+    def _vamp_energy_in_window(self) -> bool:
+        """True while the energy trigger may (still) fire this cycle."""
+        return (self._vamp_trigger == "energy" and self._vamp_armed
+                and self._vamp_silence_chunks <= self._utt_quiet_chunks
+                <= VAMP_ENERGY_MAX_SILENCE_CHUNKS)
+
+    def _vamp_step_veto_active(self, now: float) -> bool:
+        """A FRESH speech-positive VAD step asserts the user is
+        mid-utterance (e.g. an intra-utterance pause that semantic VAD
+        sees through) — defer the energy fire until a silence-confirming
+        step lands or the assertion goes stale."""
+        t_speech = self._last_step_speech_t
+        if t_speech is None or now - t_speech > VAMP_VETO_FRESH_S:
+            return False
+        t_quiet = self._last_step_quiet_t
+        return t_quiet is None or t_quiet < t_speech
 
     # -- STT event pump -----------------------------------------------------
 
@@ -595,6 +644,19 @@ class VoiceTurnLoop:
                 p_short = probs.get(BARGE_VAD_HORIZON)
                 if p_short is not None and p_short >= 0.9:
                     self._silence_seen_in_turn = True
+                # Dual-confirm bookkeeping for the energy vamp trigger,
+                # plus the catch-up fire: a silence-confirming step
+                # (including the vad-end step itself) releases a fire the
+                # veto deferred — the vamp can be late, never absent.
+                if p_short is not None:
+                    t_step = time.monotonic()
+                    if p_short <= VAMP_VETO_SPEECH_PROB:
+                        self._last_step_speech_t = t_step
+                    elif p_short >= VAMP_VETO_CLEAR_PROB:
+                        self._last_step_quiet_t = t_step
+                        if (self._state == LISTENING
+                                and self._vamp_energy_in_window()):
+                            await self._fire_vamp("energy")
                 if p_short is not None and p_short <= BARGE_VAD_SPEECH_PROB:
                     self._speech_steps += 1
                 else:
