@@ -1,0 +1,38 @@
+name: voice-platform
+label: Voice
+kind: platform
+version: 0.1.0
+description: >
+  Realtime voice-call gateway adapter. Joins a Daily (WebRTC) room as a
+  participant, streams caller audio to a streaming STT provider with
+  semantic VAD (Gradium), runs one fresh agent turn per utterance with
+  token streaming, and speaks replies through a streaming TTS provider
+  (Gradium) with sentence-level latency and barge-in support.
+
+  Two modes: "standalone" (this agent holds DAILY_API_KEY and creates its
+  own room at startup) and "orchestrated" (an external control plane
+  creates rooms, mints short-lived meeting tokens, and signals this agent
+  over an outbound SSE subscription — the agent never holds the Daily key).
+author: Supernal Technology
+requires_env:
+  - name: GRADIUM_API_KEY
+    description: "Gradium API key (streaming STT + TTS)"
+    prompt: "Gradium API key"
+    password: true
+optional_env:
+  - name: DAILY_API_KEY
+    description: "Daily API key (standalone mode only — agent creates its own room)"
+    prompt: "Daily API key (or empty for orchestrated mode)"
+    password: true
+  - name: SECOND_BRAIN_URL
+    description: "Control-plane base URL (orchestrated mode)"
+    prompt: "Control plane URL (or empty)"
+    password: false
+  - name: SECOND_BRAIN_MCP_KEY
+    description: "Per-agent control-plane API key (orchestrated mode SSE auth)"
+    prompt: "Control plane API key (or empty)"
+    password: true
+  - name: VOICE_GRADIUM_VOICE_ID
+    description: "Gradium TTS voice id"
+    prompt: "Gradium voice id (or empty for default)"
+    password: false

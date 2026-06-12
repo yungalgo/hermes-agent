@@ -720,6 +720,16 @@ platform_toolsets:
 #     extra:
 #       disable_link_previews: false  # Set true to suppress Telegram URL previews in bot messages
 #
+# Voice platform plugin (plugins/platforms/voice — realtime Daily + Gradium calls):
+#
+#   voice:
+#     enabled: true
+#     extra:
+#       mode: standalone            # standalone | orchestrated
+#       voice_id: ""                # Gradium TTS voice id (or VOICE_GRADIUM_VOICE_ID)
+#       greeting_prompt: ""         # override the agent's first-utterance prompt
+#       filler_text: "One moment."  # spoken when a tool call starts
+#
 # Discord-specific settings (config.yaml top-level, not under platforms:):
 #
 # discord:
@@ -986,6 +996,13 @@ display:
   #       telegram:
   #         cleanup_progress: true
   cleanup_progress: false
+
+  # The voice platform plugin consumes agent deltas itself (sentence-buffered
+  # TTS); disable the gateway's own streaming consumer for it.
+  # Example:
+  #   platforms:
+  #     voice:
+  #       streaming: false   # voice does its own delta consumption; disable GatewayStreamConsumer
 
   # Gateway-only natural mid-turn assistant updates.
   # When true, completed assistant status messages are sent as separate chat
