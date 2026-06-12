@@ -108,7 +108,10 @@ class TestRegisterTranscriptionProvider:
 
         assert mgr._plugins["bad-stt-plugin"].enabled is True
         assert transcription_registry.get_provider("not a provider") is None
-        assert transcription_registry.list_providers() == []
+        # Nothing beyond the bundled backends (plugins/transcription/gradium)
+        # reached the registry.
+        names = {p.name for p in transcription_registry.list_providers()}
+        assert names <= {"gradium"}
         assert "does not inherit from TranscriptionProvider" in caplog.text
 
         transcription_registry._reset_for_tests()

@@ -864,9 +864,13 @@ platform_toolsets:
 # Automatically transcribe voice messages on messaging platforms.
 # Providers: local (free, faster-whisper) | groq (free tier) | openai (Whisper API) | mistral (Voxtral Transcribe)
 # Set the corresponding API key in .env: GROQ_API_KEY, OPENAI_API_KEY, or MISTRAL_API_KEY.
+# Gradium (https://gradium.ai) ships as a bundled STT plugin
+# (plugins/transcription/gradium/) — set provider: "gradium" and
+# GRADIUM_API_KEY in .env. Resolution order when names collide:
+# built-in providers > stt.providers.<name> command providers > plugins.
 stt:
   enabled: true
-  # provider: "local"          # auto-detected if omitted
+  # provider: "local"          # auto-detected if omitted; "gradium" selects the bundled plugin
   local:
     model: "base"              # tiny | base | small | medium | large-v3 | turbo
     # language: ""             # auto-detect; set to "en", "es", "fr", etc. to force
@@ -874,6 +878,8 @@ stt:
     model: "whisper-1"         # whisper-1 | gpt-4o-mini-transcribe | gpt-4o-transcribe
   # mistral:
   #   model: "voxtral-mini-latest"  # voxtral-mini-latest | voxtral-mini-2602
+  # gradium:
+  #   language: ""             # optional BCP-47 hint forwarded to the API (e.g. "en", "ja")
 
 # =============================================================================
 # Response Pacing (Messaging Platforms)

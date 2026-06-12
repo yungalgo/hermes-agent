@@ -670,3 +670,27 @@ Override these on your provider class for richer integration:
 - `get_setup_schema()` → return `{name, badge, tag, env_vars: [{key, prompt, url}]}` to power picker rows in `hermes tools` / `hermes setup` (the picker category for STT is not yet shipped — this metadata is available to plugins for forward compatibility).
 
 See `agent/transcription_provider.py` for the full ABC including docstrings.
+
+### Gradium (bundled plugin, STT)
+
+[Gradium](https://gradium.ai) — the streaming-first speech API from the Kyutai/Moshi team — ships in-tree as a bundled transcription plugin (`plugins/transcription/gradium/`), the first consumer of the STT plugin surface above. It auto-loads; select it with `stt.provider: gradium`.
+
+```yaml
+stt:
+  enabled: true
+  provider: gradium
+  gradium:
+    language: ""        # optional BCP-47 hint (e.g. "en", "ja"); empty = auto-detect
+```
+
+```bash
+# In ~/.hermes/.env
+GRADIUM_API_KEY=your_key   # from https://gradium.ai
+```
+
+Notes:
+
+- **Batch only:** voice messages are transcribed via Gradium's one-shot REST endpoint (`POST /api/post/speech/asr`, raw audio body) — the right fit for the file-in/text-out `transcribe_audio` surface. Gradium's realtime websocket STT (semantic VAD, partials) is a different surface and not what voice-message transcription needs.
+- **Formats:** the audio `Content-Type` is derived from the file extension (`.wav`, `.mp3`, `.ogg`/`.oga`, `.opus`, `.flac`, `.m4a`, `.webm`); unknown extensions are sent as `audio/wav`.
+- **Sessions are capped at 300 seconds** of audio on the Gradium side — fine for voice messages, not a meeting-transcription replacement (no diarization either).
+- **No new dependency:** the plugin uses `httpx` (already a core dependency) — no SDK install step.

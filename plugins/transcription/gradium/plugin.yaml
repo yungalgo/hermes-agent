@@ -1,0 +1,9 @@
+name: gradium
+version: 1.0.0
+description: "Gradium (https://gradium.ai) speech-to-text backend. Requires GRADIUM_API_KEY. Batch transcription of recorded audio via the REST endpoint."
+author: yung algorithm (yungalgo)
+kind: backend
+requires_env:
+  - GRADIUM_API_KEY
+provides_transcription_providers:
+  - gradium
