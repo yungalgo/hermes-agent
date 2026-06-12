@@ -181,12 +181,17 @@ class DailyTransport:
                     self._on_audio_in(silence), self._loop)
 
     def _write_loop(self) -> None:
-        # Pacing diagnosis: track audio-seconds written vs wall-clock since
-        # the burst started. If write_frames does NOT pace at real time,
-        # audio_s will outrun wall_s and barge-in cannot stop buffered audio.
+        # WALL-CLOCK paced: write_frames sometimes returns faster than real
+        # time (Daily buffers internally — measured live 2026-06-12: the
+        # writer ran ~1.6s ahead on long replies, and barge-in's
+        # clear_output cannot claw audio back out of Daily's buffer, so the
+        # caller kept hearing the dead reply for that long). Never hand
+        # Daily chunk N+1 before chunk N's real-time due point: buffered
+        # audio is then capped at ~one 80ms chunk and barge-in cutoff stays
+        # bounded by the trigger latency, not the backlog.
         burst_t0 = 0.0
         burst_audio_s = 0.0
-        fast_count = 0
+        next_due = 0.0
         while self._running:
             try:
                 chunk = self._out_q.get(timeout=0.5)
@@ -199,27 +204,25 @@ class DailyTransport:
                 continue
             if chunk is None:
                 continue
+            now = time.monotonic()
             if burst_audio_s == 0.0:
-                burst_t0 = time.monotonic()
+                burst_t0 = now
+                next_due = now
                 logger.info("voice/daily: write burst started qsize=%d",
                             self._out_q.qsize())
+            delay = next_due - now
+            if delay > 0:
+                time.sleep(delay)
+            elif delay < -0.5:
+                next_due = time.monotonic()   # writer fell behind; resync
             t0 = time.monotonic()
             if self._write_mark_armed:
                 self._write_mark_armed = False
                 self._first_write_t = t0
-            _mic.write_frames(chunk)                          # blocking?
-            dt = time.monotonic() - t0
+            _mic.write_frames(chunk)
             chunk_s = len(chunk) / 2.0 / MIC_RATE
+            next_due += chunk_s
             burst_audio_s += chunk_s
-            if dt < chunk_s * 0.5:
-                # Write returned faster than real time — Daily is buffering.
-                fast_count += 1
-                if fast_count % 12 == 1:
-                    logger.info(
-                        "voice/daily: FAST write chunk_s=%.3f took=%.3f "
-                        "burst_audio_s=%.2f wall_s=%.2f qsize=%d",
-                        chunk_s, dt, burst_audio_s,
-                        time.monotonic() - burst_t0, self._out_q.qsize())
 
     async def send_audio(self, pcm: bytes) -> None:
         """Queue agent speech (s16le mono 48 kHz) for the caller."""

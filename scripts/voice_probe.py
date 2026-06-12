@@ -48,7 +48,19 @@ SAMPLE_RATE = 48000
 CHUNK_S = 0.08
 CHUNK_FRAMES = int(SAMPLE_RATE * CHUNK_S)          # 3840
 CHUNK_BYTES = CHUNK_FRAMES * 2
-SILENCE = b"\x00" * CHUNK_BYTES
+# Comfort noise, not digital zero: Gradium's VAD degrades on long pure-zero
+# stretches (observed live 2026-06-12 — after ~2 turns the end-of-turn
+# probability never recovered until session rotation; real mics always carry
+# room noise). RMS ~60: far below the agent's energy gates (500) and the
+# probe's own speech detector (300).
+import random as _random
+
+_random.seed(7)
+SILENCE_FRAMES = [
+    bytes(b for _ in range(CHUNK_FRAMES)
+          for b in int.to_bytes(_random.randint(-90, 90) & 0xFFFF, 2, "little"))
+    for _ in range(8)
+]
 RMS_SPEECH = 300            # s16 RMS above this counts as agent speech
 # Quiet gap that ends the agent's reply. Must exceed the worst vamp ->
 # substantive gap (~3.1s measured) or the probe mistakes the vamp clip for
@@ -161,7 +173,7 @@ class Probe:
                 chunk = self._speech_q.get_nowait()
                 is_speech = True
             except queue.Empty:
-                chunk, is_speech = SILENCE, False
+                chunk, is_speech = _random.choice(SILENCE_FRAMES), False
             self._mic.write_frames(chunk)
             if is_speech:
                 self.last_speech_write = time.monotonic()
@@ -272,10 +284,25 @@ def run_bargein(probe: Probe, utt: bytes, utt2: bytes, runs: int,
         t_barge = time.monotonic()
         print(f"run {i+1}: barge speech start wall={time.time():.3f}")
         probe.say(utt2)
-        # find when agent audio stops (>=1.5s of quiet after t_barge)
-        t_stop = probe.wait_reply_end(t_barge, timeout=40.0)
+        # The cutoff is when the OLD reply's audio stops: the first >=1.0s
+        # gap in agent speech after t_barge. (wait_reply_end's quiet window
+        # is wider than the cutoff->new-reply gap — the vamp + substantive
+        # reply to the barge utterance start ~2-3s later — so it would
+        # measure the END of the NEW reply instead.)
+        time.sleep(12.0)                  # observe well past the new reply start
+        speech = [t for t, rms in probe._snapshot()
+                  if t >= t_barge - 0.5 and rms > RMS_SPEECH]
+        t_stop = None
+        prev = t_barge
+        for t in speech:
+            if t - prev >= 2.0:
+                t_stop = prev
+                break
+            prev = t
+        if t_stop is None and speech and time.monotonic() - speech[-1] >= 2.0:
+            t_stop = speech[-1]
         if t_stop is None:
-            print(f"run {i+1}: agent audio never stopped")
+            print(f"run {i+1}: no audio gap found after barge-in")
             results.append(float("nan"))
         elif t_stop < t_barge:
             print(f"run {i+1}: agent already quiet at barge-in "
