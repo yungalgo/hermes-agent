@@ -164,6 +164,12 @@ class VoiceTurnLoop:
         self._speech_steps = 0
         self._speech_seen = False
         self._energy_hot_chunks = 0
+        # VAD barge-in requires a silence->speech TRANSITION within the
+        # current turn: a freshly-opened ASR stream can report
+        # speech-positive steps on pure silence for its first moments
+        # (observed live 2026-06-12 — it cut the greeting short), and
+        # those must never count as a barge-in.
+        self._silence_seen_in_turn = False
         # Per-turn delta/tool sinks behind stable trampolines, so an agent
         # can be CONSTRUCTED before its turn starts (construction overlaps
         # the flush wait) and still stream into the right turn's queue.
@@ -275,6 +281,7 @@ class VoiceTurnLoop:
         self._t_ref = time.monotonic()
         self._mark("canned-greeting-start", chars=len(text))
         self._state = SPEAKING
+        self._silence_seen_in_turn = False
         try:
             self._tts = await self._tts_factory(self._transport.send_audio)
             await self._tts.send_text(text)
@@ -339,13 +346,16 @@ class VoiceTurnLoop:
                 # the user is speaking NOW — do not wait for finalized text
                 # (which can lag seconds during overlapping speech).
                 p_short = probs.get(BARGE_VAD_HORIZON)
+                if p_short is not None and p_short >= 0.9:
+                    self._silence_seen_in_turn = True
                 if p_short is not None and p_short <= BARGE_VAD_SPEECH_PROB:
                     self._speech_steps += 1
                 else:
                     self._speech_steps = 0
                 if self._speech_steps >= BARGE_VAD_CONSEC_STEPS:
                     self._speech_seen = True
-                    if self._state in (THINKING, SPEAKING):
+                    if (self._state in (THINKING, SPEAKING)
+                            and self._silence_seen_in_turn):
                         self._mark("barge-in-trigger", source="vad-step",
                                    state=self._state)
                         await self._barge_in()
@@ -381,13 +391,19 @@ class VoiceTurnLoop:
                 self._spare_agent_future = self._preconstruct_agent()
             self._flushed.clear()
             self._awaiting_flush_id = None
-            # EAGER START: in live measurements the transcript is already
-            # complete at vad-end (the flush round-trip of ~370ms added no
-            # text), so the turn starts NOW with what we have. The flush
-            # below still runs; if it does deliver more text, the eager
-            # turn is interrupted (it cannot have produced audio that fast)
-            # and restarted with the full utterance.
+            # EAGER START: when the transcript at vad-end already ends in
+            # terminal punctuation it is (almost always) complete — start
+            # the turn NOW instead of serializing the ~370ms flush
+            # round-trip. Punctuation-less transcripts are missing their
+            # tail (the ASR delay is ~800ms vs the ~550ms vad-end lag —
+            # measured live: a tail arrived on every fast turn) and an
+            # eager start would only buy an interrupt+restart, so those
+            # wait for the flush. If a tail arrives despite the
+            # punctuation, the eager turn is interrupted pre-audio and
+            # restarted with the full utterance.
             eager_text = " ".join(t for t in self._pending_text if t).strip()
+            if eager_text and eager_text[-1] not in ".!?":
+                eager_text = ""
             if eager_text:
                 self._pending_text.clear()
                 self._speech_seen = False
@@ -453,6 +469,7 @@ class VoiceTurnLoop:
     def _start_turn(self, user_message: str, *, record_user: bool,
                     agent_future=None) -> None:
         self._state = THINKING
+        self._silence_seen_in_turn = False
         if self._t_ref is None:          # greeting turn has no vad-end
             self._t_ref = time.monotonic()
         self._mark("turn-start", chars=len(user_message))

@@ -455,11 +455,11 @@ async def test_eager_start_begins_turn_before_flush_ack(monkeypatch):
     try:
         await _eventually(lambda: vloop._state == turn_loop.LISTENING
                           and len(vloop._history) == 1)
-        stt.push_text("what time is it")
+        stt.push_text("what time is it?")
         stt.push_end_of_turn_step()
         # The turn is already running while finalize still awaits the ack.
         await _eventually(lambda: len(agents) == 2 and agents[1].run_kwargs)
-        assert agents[1].run_kwargs["user_message"] == "what time is it"
+        assert agents[1].run_kwargs["user_message"] == "what time is it?"
         assert vloop._finalize_task is not None
         # Ack with NO extra text: the eager turn stands, no restart.
         stt.push({"type": "flushed", "flush_id": 1})
@@ -496,15 +496,15 @@ async def test_eager_restart_when_flush_delivers_transcript_tail(monkeypatch):
     try:
         await _eventually(lambda: vloop._state == turn_loop.LISTENING
                           and len(vloop._history) == 1)
-        stt.push_text("what time is it")
+        stt.push_text("what time is it?")
         stt.push_end_of_turn_step()
         await _eventually(lambda: len(agents) == 3 and agents[2].run_kwargs)
         assert agents[1].interrupt_event.is_set()      # eager turn killed
         assert agents[2].run_kwargs["user_message"] == \
-            "what time is it right now"
+            "what time is it? right now"
         await _eventually(lambda: len(vloop._history) == 3)
         assert vloop._history[1] == {
-            "role": "user", "content": "what time is it right now"}
+            "role": "user", "content": "what time is it? right now"}
     finally:
         await vloop.stop()
         await task
@@ -555,6 +555,9 @@ async def test_barge_in_on_vad_speech_steps(monkeypatch):
         await _eventually(lambda: vloop._state == turn_loop.SPEAKING
                           and factory.instances
                           and factory.instances[0].sent)
+        # Silence first: the VAD trigger requires a silence->speech
+        # transition within the turn (fresh-stream steps are untrusted).
+        stt.push_end_of_turn_step()
         # A single speech-positive step is below the consecutive-step
         # threshold: no barge-in yet.
         stt.push_speech_step()
@@ -618,6 +621,28 @@ async def test_energy_ignored_while_listening(monkeypatch):
         assert vloop._state == turn_loop.LISTENING
         assert transport.clear_calls == 0
         assert len(agents) == 1
+    finally:
+        await vloop.stop()
+        await task
+
+
+@pytest.mark.asyncio
+async def test_vad_barge_in_requires_silence_first(monkeypatch):
+    """Speech-positive steps with NO prior silence in the turn must not
+    barge in: a freshly-opened ASR stream reports speech on pure silence
+    for its first moments (cut the greeting short live)."""
+    agents = install_agents(monkeypatch, [
+        speak_then_block("The greeting that must not be cut short. ")])
+    stt, factory, transport = FakeSTT(), FakeTTSFactory(), FakeTransport()
+    vloop = _make_loop(stt, factory, transport)
+    task = asyncio.create_task(vloop.run())
+    try:
+        await _eventually(lambda: vloop._state == turn_loop.SPEAKING)
+        for _ in range(turn_loop.BARGE_VAD_CONSEC_STEPS * 3):
+            stt.push_speech_step()
+        await asyncio.sleep(0.2)
+        assert vloop._state == turn_loop.SPEAKING
+        assert not agents[0].interrupt_event.is_set()
     finally:
         await vloop.stop()
         await task
@@ -699,7 +724,9 @@ async def test_pre_audio_barge_in_requeues_user_utterance(monkeypatch):
         stt.push_end_of_turn_step()
         await _eventually(lambda: vloop._state == turn_loop.SPEAKING)
         # user resumes speaking before hearing anything (FakeTTS produces
-        # no audio chunks, so first_audio_seen is False)
+        # no audio chunks, so first_audio_seen is False); the silence step
+        # first satisfies the silence->speech transition gate
+        stt.push_end_of_turn_step()
         stt.push_speech_step()
         stt.push_speech_step()
         await _eventually(lambda: vloop._state == turn_loop.LISTENING)
@@ -956,7 +983,7 @@ async def test_stop_cancels_pending_finalize_before_barge_in(monkeypatch):
     task = asyncio.create_task(vloop.run())
     await _eventually(lambda: vloop._state == turn_loop.LISTENING
                       and len(vloop._history) == 1)
-    stt.push_text("one last thing before you go")
+    stt.push_text("one last thing before you go!")
     stt.push_end_of_turn_step()
     # Eager start: the turn begins immediately; finalize stays pending on
     # the (never-arriving) flush ack.
