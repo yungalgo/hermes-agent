@@ -729,6 +729,7 @@ platform_toolsets:
 #       voice_id: ""                # Gradium TTS voice id (or VOICE_GRADIUM_VOICE_ID)
 #       greeting_prompt: ""         # override the agent's first-utterance prompt
 #       filler_text: "One moment."  # spoken when a tool call starts
+#       max_turns: 90               # per-utterance agent tool-loop cap (default HERMES_MAX_ITERATIONS or 90)
 #
 # Discord-specific settings (config.yaml top-level, not under platforms:):
 #
