@@ -133,6 +133,36 @@ DEFAULT_FILLER_TEXT = "One moment."
 
 LISTENING, THINKING, SPEAKING = "listening", "thinking", "speaking"
 
+# Durable telemetry sink (ENG-555): the voice/telemetry JSON records are
+# the per-call audit trail (latency legs, vamp behavior, billable ASR
+# seconds), but log lines vanish at the container's default log level and
+# on log rotation. Every record therefore ALSO appends to a JSONL file on
+# the agent volume (/opt/data persists across container restarts):
+#   docker exec <agent> tail /opt/data/voice-telemetry.jsonl
+# Fail-soft: an unwritable volume logs ONE warning and never raises into
+# the call path.
+TELEMETRY_SINK_PATH = "/opt/data/voice-telemetry.jsonl"
+_sink_warned = False
+
+
+def emit_telemetry(record: Dict[str, Any]) -> None:
+    """Emit one voice/telemetry record: log it at WARNING (visible at the
+    default container log level) and append it to the durable JSONL sink.
+    Open-append-close per record — a handful of records per call, and the
+    record must be on disk the moment the line is logged."""
+    global _sink_warned
+    line = json.dumps(record)
+    logger.warning("voice/telemetry %s", line)
+    try:
+        with open(TELEMETRY_SINK_PATH, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError as exc:
+        if not _sink_warned:
+            _sink_warned = True
+            logger.warning(
+                "voice/telemetry sink unwritable (%s): %s — records stay "
+                "in the process logs only", TELEMETRY_SINK_PATH, exc)
+
 
 def _rms(pcm: bytes) -> float:
     """RMS of s16le mono PCM (audioop-free: removed in Python 3.13).
@@ -406,7 +436,7 @@ class VoiceTurnLoop:
             },
         }
         self._vamp_veto_deferred = 0
-        logger.info("voice/telemetry %s", json.dumps(record))
+        emit_telemetry(record)
         self._call_stats.append(record)
 
     def _emit_call_summary(self) -> None:
@@ -444,7 +474,7 @@ class VoiceTurnLoop:
             "perceived_first_audio_ms": stats("perceived_first_audio_ms"),
             "substantive_first_audio_ms": stats("substantive_first_audio_ms"),
         }
-        logger.info("voice/telemetry %s", json.dumps(record))
+        emit_telemetry(record)
 
     # -- vamp -----------------------------------------------------------------
 

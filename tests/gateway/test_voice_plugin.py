@@ -14,8 +14,10 @@ import pytest
 
 from gateway.config import PlatformConfig
 from tests.gateway._plugin_adapter_loader import load_plugin_adapter
+from tests.gateway._voice_module_loader import load_voice_module
 
 _voice = load_plugin_adapter("voice")
+_turn_loop = load_voice_module("turn_loop")
 
 
 def test_platform_enum_resolves_via_plugin_scan():
@@ -249,16 +251,23 @@ class FakeModules:
             SimpleNamespace(DailyTransport=_Transport),
             SimpleNamespace(GradiumSTT=_STT),
             SimpleNamespace(GradiumTTSTurn=_TTSTurn),
-            SimpleNamespace(VoiceTurnLoop=_TurnLoop),
+            SimpleNamespace(VoiceTurnLoop=_TurnLoop,
+                            emit_telemetry=_turn_loop.emit_telemetry),
             SimpleNamespace(VampCache=_Vamp),
         )
 
 
 @pytest.fixture()
-def fake_modules(monkeypatch):
+def fake_modules(monkeypatch, tmp_path):
     fakes = FakeModules()
     monkeypatch.setattr(_voice, "_voice_modules", lambda: fakes.modules)
     monkeypatch.setenv("GRADIUM_API_KEY", "g-test")
+    # Hermetic durable sink (ENG-555): the adapter's teardown telemetry
+    # appends here instead of /opt/data on the developer machine.
+    fakes.telemetry_path = tmp_path / "voice-telemetry.jsonl"
+    monkeypatch.setattr(_turn_loop, "TELEMETRY_SINK_PATH",
+                        str(fakes.telemetry_path))
+    monkeypatch.setattr(_turn_loop, "_sink_warned", False)
     return fakes
 
 
@@ -630,6 +639,25 @@ async def test_teardown_summary_reports_asr_cost(
     assert summary["room_url"] == "https://x.daily.co/r1"
     assert summary["call_s"] >= 0
     await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_teardown_summary_appended_to_durable_sink(
+        fake_modules, monkeypatch):
+    """ENG-555 durable telemetry: the per-call teardown record (the one
+    carrying asr_seconds_est) must land in the JSONL sink so the call is
+    auditable independent of the container log level."""
+    adapter = await _joined_adapter(fake_modules, monkeypatch, extra={})
+    fake_modules.stts[0].asr_seconds_est = 42.5
+    await fake_modules.control_channels[0].on_event({"action": "leave_room"})
+    await adapter.disconnect()
+    lines = fake_modules.telemetry_path.read_text(
+        encoding="utf-8").splitlines()
+    teardowns = [json.loads(line) for line in lines
+                 if json.loads(line)["event"] == "voice_call_teardown"]
+    assert len(teardowns) == 1
+    assert teardowns[0]["reason"] == "control-leave"
+    assert teardowns[0]["asr_seconds_est"] == 42.5
 
 
 @pytest.mark.asyncio

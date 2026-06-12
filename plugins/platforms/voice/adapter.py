@@ -8,7 +8,6 @@ plugin registration, requirement checks, and the adapter lifecycle.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
 import time
@@ -339,7 +338,10 @@ class VoiceAdapter(BasePlatformAdapter):
             "call_s": round(time.monotonic() - call["started_at"], 1),
             "asr_seconds_est": round(call["stt"].asr_seconds_est, 1),
         }
-        logger.info("voice/telemetry %s", json.dumps(summary))
+        # Durable + WARNING-level emit (ENG-555): this is the per-call cost
+        # record; it must survive log levels/rotation on the agent volume.
+        (_, _, _, _, turn_loop, _) = _voice_modules()
+        turn_loop.emit_telemetry(summary)
         logger.info("voice: call ended reason=%s", reason)
 
     async def _create_standalone_room(self) -> Tuple[str, str]:
