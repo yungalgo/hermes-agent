@@ -77,6 +77,10 @@ class GradiumTTSTurn:
                 msg = json.loads(raw)
                 mtype = msg.get("type")
                 if mtype == "audio":
+                    if self._aborted:
+                        # Muted by barge-in: drop audio that races the
+                        # socket close — it must never reach the transport.
+                        continue
                     await self._on_audio(base64.b64decode(msg["audio"]))
                 elif mtype == "error":
                     logger.warning("voice/tts: server error: %s", msg.get("message"))
@@ -117,6 +121,12 @@ class GradiumTTSTurn:
             pass
         await self._done.wait()
         await self._cleanup()
+
+    def mute(self) -> None:
+        """Synchronous barge-in step: stop forwarding audio IMMEDIATELY,
+        before the (async) socket close in abort() gets a chance to run.
+        Callers clear the transport queue right after this."""
+        self._aborted = True
 
     async def abort(self) -> None:
         """Barge-in: hard-close the socket, drop pending audio server-side."""

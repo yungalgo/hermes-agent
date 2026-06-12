@@ -131,6 +131,28 @@ async def test_end_returns_after_server_end_of_stream(fake_ws):
 
 
 @pytest.mark.asyncio
+async def test_mute_drops_audio_immediately_without_closing(fake_ws):
+    """mute() is the synchronous half of barge-in: audio still arriving on
+    the socket is dropped on the floor, before/while abort() closes it."""
+    received = []
+
+    async def on_audio(pcm: bytes) -> None:
+        received.append(pcm)
+
+    turn = gradium_tts.GradiumTTSTurn("g-key", "", on_audio)
+    await turn.open()
+    turn.mute()                      # sync — no await needed
+    await fake_ws.inbox.put(
+        {"type": "audio",
+         "audio": base64.b64encode(b"\x00\x01").decode("ascii")})
+    await fake_ws.inbox.put({"type": "end_of_stream"})
+    await asyncio.sleep(0.05)
+    assert received == []            # the racing chunk never got through
+    await turn.abort()
+    assert fake_ws.closed is True
+
+
+@pytest.mark.asyncio
 async def test_abort_closes_socket_and_gates_send_text(fake_ws):
     turn = gradium_tts.GradiumTTSTurn("g-key", "", _noop_audio)
     await turn.open()
