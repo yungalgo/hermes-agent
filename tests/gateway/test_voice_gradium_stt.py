@@ -218,3 +218,60 @@ async def test_flush_noop_without_live_session(fake_ws):
     assert await stt.flush() == 1
     await stt.stop()
     assert await stt.flush() is None        # closed
+
+
+@pytest.mark.asyncio
+async def test_watchdog_rotates_deaf_session(fake_ws, monkeypatch):
+    """DEAF session (observed live 2026-06-12): socket alive, audio being
+    sent, but the step stream just stops — end-of-turn detection goes dark
+    until the wall-clock rotation minutes later. The watchdog must rotate
+    on step-silence-while-sending instead of waiting for the wall clock."""
+    monkeypatch.setattr(gradium_stt, "WATCHDOG_INTERVAL_S", 0.05)
+    monkeypatch.setattr(gradium_stt, "DEAF_AFTER_S", 0.2)
+    stt = gradium_stt.GradiumSTT("g-key")
+    await stt.start()
+    first = stt._session
+    # Audio is flowing out, but the server sends NO step events back.
+    for _ in range(30):
+        await stt.send_audio(b"\x00\x00" * 1920)
+        await asyncio.sleep(0.02)
+        if stt._session is not first:
+            break
+    assert stt._session is not first
+    assert first.closed is True
+    await stt.stop()
+
+
+@pytest.mark.asyncio
+async def test_no_deaf_rotation_while_steps_flow(fake_ws, monkeypatch):
+    """Steps arriving on time must keep the deaf trigger quiet."""
+    monkeypatch.setattr(gradium_stt, "WATCHDOG_INTERVAL_S", 0.05)
+    monkeypatch.setattr(gradium_stt, "DEAF_AFTER_S", 0.2)
+    stt = gradium_stt.GradiumSTT("g-key")
+    await stt.start()
+    first = stt._session
+    for _ in range(20):
+        await stt.send_audio(b"\x00\x00" * 1920)
+        # the server answers with a step (recv loop stamps last_step_t)
+        fake_ws.inbox.put_nowait({
+            "type": "step", "total_duration_s": 0.08,
+            "vad": [{"horizon_s": 0.5, "inactivity_prob": 1.0}]})
+        await asyncio.sleep(0.02)
+    assert stt._session is first
+    await stt.stop()
+
+
+@pytest.mark.asyncio
+async def test_no_deaf_rotation_without_recent_audio(fake_ws, monkeypatch):
+    """No audio being sent (muted caller handled by keep-alive upstream;
+    here: nothing at all) means step silence is EXPECTED — the deaf
+    trigger must not churn sessions. (Wall-clock rotation still covers
+    the 300s kill.)"""
+    monkeypatch.setattr(gradium_stt, "WATCHDOG_INTERVAL_S", 0.05)
+    monkeypatch.setattr(gradium_stt, "DEAF_AFTER_S", 0.1)
+    stt = gradium_stt.GradiumSTT("g-key")
+    await stt.start()
+    first = stt._session
+    await asyncio.sleep(0.5)
+    assert stt._session is first
+    await stt.stop()

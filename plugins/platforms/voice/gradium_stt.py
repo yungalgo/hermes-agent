@@ -44,6 +44,14 @@ SILENCE_PROB_FOR_ROTATE = 0.8  # horizon-0.5 inactivity required to rotate
 # a session whose socket died.
 HARD_ROTATE_AFTER_S = 270.0
 WATCHDOG_INTERVAL_S = 5.0
+# DEAF session: socket alive, audio being sent, but NO step events coming
+# back. Observed live 2026-06-12 (twice): ~90-120s into a session the step
+# stream just stops while the websocket stays open — end-of-turn detection
+# goes dark for minutes until the wall-clock rotation finally replaces the
+# session. The server emits a step every 80ms of audio, so multiple seconds
+# of step silence while we are actively sending is unambiguous.
+DEAF_AFTER_S = 10.0
+AUDIO_RECENT_S = 2.0
 
 
 class _Session:
@@ -69,6 +77,8 @@ class _Session:
         self.total_duration_s = 0.0
         self.closed = False
         self.opened_at = 0.0
+        self.last_step_t = 0.0
+        self.last_audio_sent_t = 0.0
 
     @property
     def dead(self) -> bool:
@@ -85,6 +95,7 @@ class _Session:
             {"type": "setup", "model_name": "default", "input_format": "pcm"}
         ))
         self.opened_at = time.monotonic()
+        self.last_step_t = self.opened_at
         self._recv_task = asyncio.create_task(self._recv_loop())
 
     async def _recv_loop(self) -> None:
@@ -93,6 +104,7 @@ class _Session:
                 msg = json.loads(raw)
                 if msg.get("type") == "step":
                     self.total_duration_s = float(msg.get("total_duration_s") or 0.0)
+                    self.last_step_t = time.monotonic()
                 await self._out.put(msg)
                 if msg.get("type") == "end_of_stream":
                     break
@@ -104,6 +116,7 @@ class _Session:
                 await self._out.put({"type": "error", "message": str(e)})
 
     async def send_audio(self, pcm: bytes) -> None:
+        self.last_audio_sent_t = time.monotonic()
         await self._ws.send(json.dumps(
             {"type": "audio", "audio": base64.b64encode(pcm).decode("ascii")}
         ))
@@ -171,13 +184,20 @@ class GradiumSTT:
                 s = self._session
                 if s is None or self._rotating:
                     continue
+                now = time.monotonic()
                 if s.dead:
                     logger.warning("voice/stt: session died; reconnecting")
                     await self._replace_session(s)
-                elif time.monotonic() - s.opened_at > HARD_ROTATE_AFTER_S:
+                elif now - s.opened_at > HARD_ROTATE_AFTER_S:
                     logger.info(
                         "voice/stt: wall-clock rotation at %.0fs session age",
-                        time.monotonic() - s.opened_at)
+                        now - s.opened_at)
+                    await self._replace_session(s)
+                elif (now - s.last_step_t > DEAF_AFTER_S
+                        and now - s.last_audio_sent_t < AUDIO_RECENT_S):
+                    logger.warning(
+                        "voice/stt: DEAF session (no step for %.0fs while "
+                        "sending audio); rotating", now - s.last_step_t)
                     await self._replace_session(s)
             except asyncio.CancelledError:
                 raise

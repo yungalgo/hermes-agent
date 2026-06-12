@@ -50,7 +50,10 @@ CHUNK_FRAMES = int(SAMPLE_RATE * CHUNK_S)          # 3840
 CHUNK_BYTES = CHUNK_FRAMES * 2
 SILENCE = b"\x00" * CHUNK_BYTES
 RMS_SPEECH = 300            # s16 RMS above this counts as agent speech
-REPLY_END_SILENCE_S = 2.0   # this much quiet ends the agent's reply
+# Quiet gap that ends the agent's reply. Must exceed the worst vamp ->
+# substantive gap (~3.1s measured) or the probe mistakes the vamp clip for
+# the whole reply and the NEXT run collides with the late substantive audio.
+REPLY_END_SILENCE_S = 4.0
 DAILY_API = "https://api.daily.co/v1"
 
 MIC = "probe-mic"
