@@ -34,7 +34,13 @@ logger = logging.getLogger(__name__)
 ASR_URL = "wss://api.gradium.ai/api/speech/asr"
 SAMPLE_RATE = 24000          # "pcm" input_format default
 CHUNK_SAMPLES = 1920         # 80 ms
-ROTATE_AFTER_S = 240.0       # rotate well before the 300s session cap
+# Measured live (4 sessions, 2026-06-12): after ~90-105s of continuous audio
+# the session's LONG-horizon VAD probabilities (1.0/2.0/3.0s) collapse to a
+# permanent 0.0 while the socket stays open and steps keep flowing — so
+# end-of-turn detection (2.0s horizon) goes dark until the session is
+# replaced. Rotating at 75s (during a silence window, sockets overlapped)
+# stays safely below the degradation point AND the 300s hard cap.
+ROTATE_AFTER_S = 75.0
 SILENCE_PROB_FOR_ROTATE = 0.8  # horizon-0.5 inactivity required to rotate
 # The server kills sessions at 300s of WALL CLOCK, not processed audio.
 # maybe_rotate only runs on step events (which require audio inflow), so a
