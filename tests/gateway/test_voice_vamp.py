@@ -115,6 +115,21 @@ def test_resolve_vamp_trigger():
     assert turn_loop._resolve_vamp_trigger({"vamp_trigger": "bogus"}) == "energy"
 
 
+def test_resolve_reasoning_override():
+    """platforms.voice.extra.reasoning_effort overrides the gateway
+    reasoning effort for voice turns only (thinking tokens delay the
+    first spoken sentence). None/invalid = use the gateway default."""
+    assert turn_loop._resolve_reasoning_override({}) is None
+    assert turn_loop._resolve_reasoning_override(
+        {"reasoning_effort": "none"}) == {"enabled": False}
+    assert turn_loop._resolve_reasoning_override(
+        {"reasoning_effort": "low"}) == {"enabled": True, "effort": "low"}
+    assert turn_loop._resolve_reasoning_override(
+        {"reasoning_effort": "bogus"}) is None
+    assert turn_loop._resolve_reasoning_override(
+        {"reasoning_effort": ""}) is None
+
+
 def test_resolve_int_extra():
     assert turn_loop._resolve_int_extra({}, "barge_energy_chunks", 2) == 2
     assert turn_loop._resolve_int_extra(
@@ -584,6 +599,9 @@ async def test_vad_end_step_catches_up_a_vetoed_fire(monkeypatch, caplog):
                 if r["event"] == "voice_turn" and r["vad_end_ms"] is not None]
         assert recs and recs[0]["vamp"]["fired"] is True
         assert recs[0]["vamp"]["trigger"] == "energy"
+        assert recs[0]["vamp"]["veto_deferred_chunks"] >= 1
+        # "what time is it" has no terminal punctuation -> no eager start
+        assert recs[0]["eager_start"] is False
     finally:
         await vloop.stop()
         await task
@@ -655,11 +673,14 @@ async def test_turn_telemetry_record_shape_and_call_summary(
     for key in ("vad_end_ms", "flush_result", "flush_done_ms",
                 "agent_start_ms", "first_delta_ms", "first_sentence_ms",
                 "tts_first_audio_ms", "first_frame_written_ms",
-                "vamp", "totals", "status", "turn"):
+                "vamp", "totals", "status", "turn", "eager_start"):
         assert key in rec, key
     assert rec["status"] == "ok"
     assert rec["flush_result"] == "ack"
+    # "what time is it?" ends in terminal punctuation -> eager start
+    assert rec["eager_start"] is True
     assert rec["vamp"]["fired_at_ms"] is not None
+    assert rec["vamp"]["veto_deferred_chunks"] == 0
     # vamp fired BEFORE vad-end (it rides the faster energy signal)
     assert rec["vamp"]["fired_at_ms"] <= rec["vad_end_ms"]
     assert rec["totals"]["perceived_first_audio_ms"] is not None
@@ -674,9 +695,35 @@ async def test_turn_telemetry_record_shape_and_call_summary(
     assert summary["turns"] == 1
     assert summary["vamp_fired"] == 1
     assert summary["vamp_false_fires"] == 0
+    # Config-drift guards (verify run: substantive first-audio regressed
+    # 2.6s -> ~4s; the matrix's Haiku override may have been absent): the
+    # summary names the effective per-turn config so a live run is
+    # self-describing.
+    assert summary["model_override"] is None        # extra.model unset here
+    assert summary["reasoning_effort"] == "gateway-default"
+    assert summary["eager_starts"] == 1
     assert summary["perceived_first_audio_ms"]["n"] == 1
     assert "median" in summary["perceived_first_audio_ms"]
     assert "p90" in summary["perceived_first_audio_ms"]
+
+
+@pytest.mark.asyncio
+async def test_call_summary_names_model_and_reasoning_overrides(
+        monkeypatch, caplog):
+    install_agents(monkeypatch, [say(GREETING_REPLY)])
+    stt, factory = FakeSTT(), FakeTTSFactory()
+    transport = MarkedTransport()
+    vloop = _make_loop(stt, factory, transport, extra={
+        "model": "claude-haiku-4-5-20251001", "reasoning_effort": "none"})
+    caplog.set_level("INFO", logger=turn_loop.__name__)
+    task = asyncio.create_task(vloop.run())
+    await _await_listening_after_greeting(vloop)
+    await vloop.stop()
+    await task
+    summaries = [r for r in _telemetry_records(caplog)
+                 if r["event"] == "voice_call_summary"]
+    assert summaries[0]["model_override"] == "claude-haiku-4-5-20251001"
+    assert summaries[0]["reasoning_effort"] == "none"
 
 
 # ---------------------------------------------------------------------------

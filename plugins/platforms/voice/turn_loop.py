@@ -154,6 +154,24 @@ def _resolve_turn_model(extra: Dict[str, Any]) -> Optional[str]:
     return model or None
 
 
+def _resolve_reasoning_override(extra: Dict[str, Any]) -> Optional[dict]:
+    """platforms.voice.extra.reasoning_effort overrides the gateway
+    reasoning effort for voice turns only: thinking tokens run before the
+    first text delta, i.e. straight on top of substantive first-audio
+    (verify run 2026-06-12: first_delta ~3.2s after agent_start on the
+    default model — model choice and reasoning effort are the two
+    config-side levers). None = use the gateway default."""
+    raw = (extra or {}).get("reasoning_effort")
+    if raw is None or not str(raw).strip():
+        return None
+    from hermes_constants import parse_reasoning_effort
+
+    parsed = parse_reasoning_effort(str(raw))
+    if parsed is None:
+        logger.warning("voice/turn: invalid reasoning_effort %r ignored", raw)
+    return parsed
+
+
 def _resolve_int_extra(extra: Dict[str, Any], key: str, default: int) -> int:
     raw = (extra or {}).get(key)
     if raw is None:
@@ -225,7 +243,8 @@ def _create_voice_agent(
         stream_delta_callback=stream_delta_callback,
         tool_progress_callback=tool_progress_callback,
         fallback_model=GatewayRunner._load_fallback_model(),
-        reasoning_config=GatewayRunner._load_reasoning_config(),
+        reasoning_config=(_resolve_reasoning_override(extra or {})
+                          or GatewayRunner._load_reasoning_config()),
     )
 
 
@@ -363,6 +382,7 @@ class VoiceTurnLoop:
             "event": "voice_turn",
             "turn": self._turn_seq,
             "status": status,
+            "eager_start": bool(tel.get("eager_start")),
             "vad_end_ms": off(tel.get("vad_end")),
             "flush_result": tel.get("flush_result"),
             "flush_done_ms": off(tel.get("flush_done")),
@@ -401,10 +421,21 @@ class VoiceTurnLoop:
                     "p90": vals[min(len(vals) - 1, int(len(vals) * 0.9))],
                     "n": len(vals)}
 
+        raw_effort = self._extra.get("reasoning_effort")
         record = {
             "event": "voice_call_summary",
             "session": self._session_id,
             "turns": len(turns),
+            # Effective per-turn config, so a live run is self-describing
+            # (the 2.6s->~4s substantive regression in the verify run is
+            # unexplainable from the telemetry alone when the model /
+            # reasoning overrides are not recorded).
+            "model_override": _resolve_turn_model(self._extra),
+            "reasoning_effort": (str(raw_effort).strip()
+                                 if raw_effort is not None
+                                 and str(raw_effort).strip()
+                                 else "gateway-default"),
+            "eager_starts": sum(1 for r in turns if r["eager_start"]),
             "vamp_fired": sum(1 for r in turns if r["vamp"]["fired"]),
             "vamp_false_fires": sum(
                 1 for r in self._call_stats if r["vamp"]["false_fire"]),
@@ -729,6 +760,7 @@ class VoiceTurnLoop:
                 self._pending_text.clear()
                 self._speech_seen = False
                 self._speech_steps = 0
+                self._tel_set("eager_start", True)
                 agent_future = self._spare_agent_future
                 self._spare_agent_future = None
                 self._start_turn(eager_text, record_user=True,
