@@ -38,14 +38,25 @@ SILENCE_PROB_FOR_ROTATE = 0.8  # horizon-0.5 inactivity required to rotate
 
 
 class _Session:
-    """One ASR websocket. Created by GradiumSTT; not used directly."""
+    """One ASR websocket. Created by GradiumSTT; not used directly.
 
-    def __init__(self, api_key: str, out: "asyncio.Queue[Dict[str, Any]]"):
+    ``next_flush_id`` is supplied by the parent GradiumSTT so flush ids are
+    monotonic across the WHOLE call, not per socket: rotated sessions share
+    one events queue, and a per-socket counter would let a stale ack from
+    the old socket collide with (and falsely satisfy) a new flush wait.
+    """
+
+    def __init__(
+        self,
+        api_key: str,
+        out: "asyncio.Queue[Dict[str, Any]]",
+        next_flush_id,
+    ):
         self._api_key = api_key
         self._out = out
         self._ws = None
         self._recv_task: Optional[asyncio.Task] = None
-        self._flush_seq = 0
+        self._next_flush_id = next_flush_id
         self.total_duration_s = 0.0
         self.closed = False
 
@@ -81,9 +92,9 @@ class _Session:
         ))
 
     async def flush(self) -> int:
-        self._flush_seq += 1
-        await self._ws.send(json.dumps({"type": "flush", "flush_id": self._flush_seq}))
-        return self._flush_seq
+        flush_id = self._next_flush_id()
+        await self._ws.send(json.dumps({"type": "flush", "flush_id": flush_id}))
+        return flush_id
 
     async def close(self) -> None:
         self.closed = True
@@ -119,9 +130,16 @@ class GradiumSTT:
         self._events: "asyncio.Queue[Dict[str, Any]]" = asyncio.Queue()
         self._session: Optional[_Session] = None
         self._rotating = False
+        # Call-scoped flush counter: monotonic across session rotations so a
+        # flush id is never reused and stale acks can never match a new wait.
+        self._flush_seq = 0
+
+    def _next_flush_id(self) -> int:
+        self._flush_seq += 1
+        return self._flush_seq
 
     async def start(self) -> None:
-        self._session = _Session(self._api_key, self._events)
+        self._session = _Session(self._api_key, self._events, self._next_flush_id)
         await self._session.open()
 
     async def send_audio(self, pcm: bytes) -> None:
@@ -132,7 +150,8 @@ class GradiumSTT:
     async def flush(self) -> Optional[int]:
         """Request a transcript flush. Returns the flush_id to await, or
         None when no session is live (no ``flushed`` event will ever
-        arrive — callers pair flush waits with a timeout)."""
+        arrive — callers pair flush waits with a timeout). Ids are
+        monotonic across the whole call, including session rotations."""
         if self._session is None or self._session.closed:
             return None
         return await self._session.flush()
@@ -150,7 +169,7 @@ class GradiumSTT:
         self._rotating = True
         old = self._session
         try:
-            fresh = _Session(self._api_key, self._events)
+            fresh = _Session(self._api_key, self._events, self._next_flush_id)
             await fresh.open()                 # overlap: new socket live first
             self._session = fresh
             await old.close()

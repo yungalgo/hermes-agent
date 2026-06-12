@@ -148,6 +148,30 @@ async def test_events_yields_server_messages(fake_ws):
 
 
 @pytest.mark.asyncio
+async def test_flush_ids_monotonic_across_rotation(fake_ws):
+    """Flush ids are CALL-scoped, not socket-scoped: after a session
+    rotation, new flush ids keep counting up, so a stale ack from the
+    pre-rotation socket can never collide with a post-rotation wait
+    (both sessions share one events queue)."""
+    stt = gradium_stt.GradiumSTT("g-key")
+    await stt.start()
+    pre_rotation_ids = [await stt.flush(), await stt.flush()]
+    assert pre_rotation_ids == [1, 2]
+    first = stt._session
+    first.total_duration_s = 250.0
+    await stt.maybe_rotate({"vad": _vad(0.95)})
+    assert stt._session is not first
+    new_id = await stt.flush()
+    assert new_id > max(pre_rotation_ids)
+    # A stale pre-rotation ack can never satisfy a wait keyed on new_id.
+    assert new_id not in pre_rotation_ids
+    # The wire frames carried the monotonic ids — no per-socket restart.
+    flush_frames = [m for m in fake_ws.sent if m.get("type") == "flush"]
+    assert [f["flush_id"] for f in flush_frames] == [1, 2, 3]
+    await stt.stop()
+
+
+@pytest.mark.asyncio
 async def test_flush_noop_without_live_session(fake_ws):
     stt = gradium_stt.GradiumSTT("g-key")
     assert await stt.flush() is None        # never started

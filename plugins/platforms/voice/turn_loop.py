@@ -33,6 +33,7 @@ import asyncio
 import logging
 import os
 import re
+import threading
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -47,6 +48,11 @@ END_OF_TURN_HORIZON = 2.0
 END_OF_TURN_PROB = 0.7
 FLUSHED_WAIT_TIMEOUT_S = 2.0
 TTS_END_TIMEOUT_S = 30.0
+# Bound on awaiting the executor-run agent after a turn ends (normally the
+# future is already done; after an interrupt a well-behaved agent returns
+# promptly). The thread itself cannot be killed, but the event loop must
+# never block on a generation that ignores its interrupt.
+RUN_FUTURE_TIMEOUT_S = 60.0
 DEFAULT_GREETING_PROMPT = (
     "(The user just joined a voice call with you. Greet them by voice in "
     "one short, warm sentence and ask how you can help.)"
@@ -120,6 +126,10 @@ class VoiceTurnLoop:
         # One-element list so the executor thread can publish the live agent
         # for cross-thread interrupt (api_server agent_ref pattern, 3505-3508).
         self._agent_ref: List[Optional[Any]] = [None]
+        # Per-turn interrupt latch: a barge-in landing while the executor
+        # thread is still CONSTRUCTING the agent (agent_ref[0] unset) must
+        # not be lost — _run checks it right after construction.
+        self._interrupt_latch: Optional[threading.Event] = None
         self._tts = None
         self._turn_task: Optional[asyncio.Task] = None
         self._finalize_task: Optional[asyncio.Task] = None
@@ -142,13 +152,16 @@ class VoiceTurnLoop:
             pass
 
     async def stop(self) -> None:
-        await self._barge_in()           # kill any in-flight turn
+        # Cancel a pending finalize BEFORE barge-in: barge-in awaits the
+        # in-flight turn, and a still-live finalize could _start_turn in
+        # that window, orphaning a fresh turn past teardown.
         if self._finalize_task is not None and not self._finalize_task.done():
             self._finalize_task.cancel()
             try:
                 await self._finalize_task
             except (asyncio.CancelledError, Exception):
                 pass
+        await self._barge_in()           # kill any in-flight turn
         self._stopped.set()
 
     # -- STT event pump -----------------------------------------------------
@@ -209,6 +222,9 @@ class VoiceTurnLoop:
 
     def _start_turn(self, user_message: str, *, record_user: bool) -> None:
         self._state = THINKING
+        # Fresh latch BEFORE the task exists so a barge-in can never land
+        # between turn creation and the executor publishing the agent.
+        self._interrupt_latch = threading.Event()
         self._turn_task = asyncio.create_task(
             self._execute_turn(user_message, record_user=record_user))
 
@@ -217,6 +233,7 @@ class VoiceTurnLoop:
         q: "asyncio.Queue[tuple]" = asyncio.Queue()
         agent_ref = self._agent_ref
         agent_ref[0] = None
+        interrupt_latch = self._interrupt_latch
 
         # Threadsafe marshal — mirrors api_server._enqueue (1619-1631).
         def _enqueue(item: tuple) -> None:
@@ -248,6 +265,13 @@ class VoiceTurnLoop:
             agent = _create_voice_agent(
                 self._session_id, _delta, _tool_progress, extra=self._extra)
             agent_ref[0] = agent
+            if interrupt_latch.is_set():
+                # A barge-in/stop landed while the agent was still being
+                # constructed: interrupt before the first iteration runs.
+                try:
+                    agent.interrupt("user barge-in (voice)")
+                except Exception:
+                    pass
             try:
                 return agent.run_conversation(
                     user_message=user_message,
@@ -276,8 +300,24 @@ class VoiceTurnLoop:
             raise
         finally:
             self._tts = None
+            if interrupted and agent_ref[0] is not None:
+                # The latch may have raced agent construction; now that the
+                # agent surely exists, re-issue the direct interrupt so the
+                # bounded await below resolves promptly.
+                try:
+                    agent_ref[0].interrupt("user barge-in (voice)")
+                except Exception:
+                    pass
             try:
-                result = await run_future
+                result = await asyncio.wait_for(
+                    run_future, timeout=RUN_FUTURE_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                logger.error(
+                    "voice/turn: agent run did not finish within %.0fs after "
+                    "the turn ended; abandoning executor thread (it may "
+                    "still be running and burning tokens)",
+                    RUN_FUTURE_TIMEOUT_S)
+                result = None
             except Exception:
                 logger.exception("voice/turn: agent run failed")
                 result = None
@@ -328,6 +368,12 @@ class VoiceTurnLoop:
     # -- barge-in -----------------------------------------------------------
 
     async def _barge_in(self) -> None:
+        # Latch first: if the executor thread is still constructing the
+        # agent, _run picks this up right after construction and interrupts
+        # before the first iteration (the direct path below would miss it).
+        latch = self._interrupt_latch
+        if latch is not None:
+            latch.set()
         agent = self._agent_ref[0]
         if agent is not None:
             try:

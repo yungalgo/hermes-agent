@@ -480,3 +480,171 @@ async def test_stop_cancels_inflight_turn(monkeypatch):
     await asyncio.wait_for(task, timeout=5.0)
     assert agents[0].interrupt_event.is_set()
     assert factory.instances[0].aborted is True
+
+
+@pytest.mark.asyncio
+async def test_stale_pre_rotation_ack_does_not_satisfy_new_flush_wait(monkeypatch):
+    """A ``flushed`` ack carrying an OLD flush id (e.g. replayed by the
+    pre-rotation socket — both sessions share one events queue) must not
+    satisfy a wait keyed on a NEWER id: the loop waits out the timeout
+    instead of being falsely released."""
+    monkeypatch.setattr(turn_loop, "FLUSHED_WAIT_TIMEOUT_S", 0.3)
+
+    class StaleAckSTT(FakeSTT):
+        async def flush(self):
+            self.flush_calls += 1
+            # First flush acked correctly; every later flush only ever
+            # sees a REPLAY of the old ack (id 1).
+            self.queue.put_nowait({"type": "flushed", "flush_id": 1})
+            return self.flush_calls
+
+    agents = install_agents(monkeypatch, [
+        say(GREETING_REPLY),
+        say("First answer, complete and properly delivered."),
+        say("Second answer, complete and properly delivered."),
+    ])
+    stt = StaleAckSTT()
+    factory, transport = FakeTTSFactory(), FakeTransport()
+    vloop = _make_loop(stt, factory, transport)
+    task = asyncio.create_task(vloop.run())
+    try:
+        await _eventually(lambda: vloop._state == turn_loop.LISTENING
+                          and len(vloop._history) == 1)
+        stt.push_text("first question for you")
+        stt.push_end_of_turn_step()
+        await _eventually(lambda: len(agents) == 2 and len(vloop._history) == 3)
+        # Second user turn: flush id 2, but only the stale ack (id 1) arrives.
+        stt.push_text("second question for you")
+        start = time.monotonic()
+        stt.push_end_of_turn_step()
+        await _eventually(lambda: len(agents) == 3 and agents[2].run_kwargs)
+        elapsed = time.monotonic() - start
+        # The stale ack did NOT release the wait: the full (reduced)
+        # flush timeout was burned before proceeding.
+        assert elapsed >= 0.3
+        assert agents[2].run_kwargs["user_message"] == "second question for you"
+        assert not vloop._flushed.is_set()
+    finally:
+        await vloop.stop()
+        await task
+
+
+@pytest.mark.asyncio
+async def test_barge_in_before_agent_constructed_still_interrupts(monkeypatch):
+    """A barge-in landing while the executor thread is still CONSTRUCTING
+    the agent (agent_ref[0] not yet set) must still interrupt the
+    generation: the interrupt latch is checked right after construction,
+    before the first iteration."""
+    construction_entered = threading.Event()
+    construction_gate = threading.Event()
+    agents = []
+
+    def _gated_create(session_id, stream_delta_callback,
+                      tool_progress_callback, *, extra=None):
+        construction_entered.set()
+        construction_gate.wait(10.0)     # hold agent_ref[0] unset
+        agent = FakeAgent(
+            speak_then_block("A story that should never be told. "),
+            stream_delta_callback, tool_progress_callback)
+        agents.append(agent)
+        return agent
+
+    monkeypatch.setattr(turn_loop, "_create_voice_agent", _gated_create)
+    stt, factory, transport = FakeSTT(), FakeTTSFactory(), FakeTransport()
+    vloop = _make_loop(stt, factory, transport)
+    task = asyncio.create_task(vloop.run())
+    try:
+        await _eventually(lambda: construction_entered.is_set())
+        # Barge-in NOW: no agent exists yet, so the direct interrupt path
+        # cannot fire — only the latch can carry it.
+        stt.push_text("stop")
+        await _eventually(
+            lambda: vloop._interrupt_latch is not None
+            and vloop._interrupt_latch.is_set(),
+            msg="barge-in did not latch before agent construction")
+        assert agents == []              # constructed AFTER the barge-in
+        construction_gate.set()
+        await _eventually(
+            lambda: agents and agents[0].interrupt_event.is_set(),
+            msg="latched barge-in never interrupted the agent")
+        assert agents[0].interrupt_reason == "user barge-in (voice)"
+        await _eventually(lambda: vloop._state == turn_loop.LISTENING)
+        assert vloop._history == []
+    finally:
+        construction_gate.set()
+        await vloop.stop()
+        await task
+
+
+@pytest.mark.asyncio
+async def test_interrupted_turn_await_is_bounded(monkeypatch, caplog):
+    """An agent that IGNORES interrupt() cannot block the consumer/teardown
+    forever: the post-interrupt await on the executor future is bounded by
+    RUN_FUTURE_TIMEOUT_S and aborts with a loud log."""
+    assert turn_loop.RUN_FUTURE_TIMEOUT_S == 60.0   # generous default bound
+    monkeypatch.setattr(turn_loop, "RUN_FUTURE_TIMEOUT_S", 0.3)
+    release = threading.Event()
+
+    def deaf_behavior(agent):
+        # Ignores agent.interrupt_event entirely — a worst-case generation.
+        agent.delta_cb("I am going to keep talking no matter what you say. ")
+        release.wait(10.0)
+        return {"final_response": "too late"}
+
+    agents = install_agents(monkeypatch, [deaf_behavior])
+    stt, factory, transport = FakeSTT(), FakeTTSFactory(), FakeTransport()
+    vloop = _make_loop(stt, factory, transport)
+    task = asyncio.create_task(vloop.run())
+    try:
+        await _eventually(lambda: vloop._state == turn_loop.SPEAKING
+                          and factory.instances
+                          and factory.instances[0].sent)
+        with caplog.at_level("ERROR", logger=turn_loop.__name__):
+            start = time.monotonic()
+            stt.push_text("please stop now")
+            # Returns to LISTENING well before the 10s the deaf agent
+            # blocks for — the await was bounded, not orphaned silently.
+            await _eventually(lambda: vloop._state == turn_loop.LISTENING,
+                              msg="bounded await never released the loop")
+            assert time.monotonic() - start < 5.0
+        assert agents[0].interrupt_event.is_set()   # interrupt WAS issued
+        assert "abandoning executor thread" in caplog.text
+        assert vloop._history == []                  # nothing recorded
+    finally:
+        release.set()
+        await vloop.stop()
+        await task
+
+
+@pytest.mark.asyncio
+async def test_stop_cancels_pending_finalize_before_barge_in(monkeypatch):
+    """stop() must cancel a pending finalize BEFORE barge-in: otherwise the
+    finalize can _start_turn in the window and orphan a fresh turn."""
+    agents = install_agents(monkeypatch, [say(GREETING_REPLY)])
+    stt = FakeSTT(auto_ack=False)    # finalize blocks awaiting the flush ack
+    factory, transport = FakeTTSFactory(), FakeTransport()
+    vloop = _make_loop(stt, factory, transport)
+    task = asyncio.create_task(vloop.run())
+    await _eventually(lambda: vloop._state == turn_loop.LISTENING
+                      and len(vloop._history) == 1)
+    stt.push_text("one last thing before you go")
+    stt.push_end_of_turn_step()
+    await _eventually(lambda: vloop._finalize_task is not None,
+                      msg="finalize never became pending")
+    # Spy: by the time stop() reaches _barge_in, finalize must be gone.
+    orig_barge_in = vloop._barge_in
+    finalize_gone_at_barge_in = []
+
+    async def spy_barge_in():
+        t = vloop._finalize_task
+        finalize_gone_at_barge_in.append(t is None or t.done())
+        await orig_barge_in()
+
+    vloop._barge_in = spy_barge_in
+    await vloop.stop()
+    await asyncio.wait_for(task, timeout=5.0)
+    assert finalize_gone_at_barge_in == [True]
+    # The pending finalize never spawned a fresh (orphaned) turn.
+    assert len(agents) == 1
+    assert len(factory.instances) == 1
+    assert vloop._history == [{"role": "assistant", "content": GREETING_REPLY}]
