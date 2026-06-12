@@ -151,14 +151,42 @@ class DailyTransport:
             asyncio.run_coroutine_threadsafe(self._on_audio_in(frames), self._loop)
 
     def _write_loop(self) -> None:
+        # Pacing diagnosis: track audio-seconds written vs wall-clock since
+        # the burst started. If write_frames does NOT pace at real time,
+        # audio_s will outrun wall_s and barge-in cannot stop buffered audio.
+        burst_t0 = 0.0
+        burst_audio_s = 0.0
+        fast_count = 0
         while self._running:
             try:
                 chunk = self._out_q.get(timeout=0.5)
             except queue.Empty:
+                if burst_audio_s > 0.0:
+                    logger.info(
+                        "voice/daily: write burst ended audio_s=%.2f wall_s=%.2f",
+                        burst_audio_s, time.monotonic() - burst_t0)
+                    burst_audio_s = 0.0
                 continue
             if chunk is None:
                 continue
-            _mic.write_frames(chunk)                          # blocking, paces RT
+            if burst_audio_s == 0.0:
+                burst_t0 = time.monotonic()
+                logger.info("voice/daily: write burst started qsize=%d",
+                            self._out_q.qsize())
+            t0 = time.monotonic()
+            _mic.write_frames(chunk)                          # blocking?
+            dt = time.monotonic() - t0
+            chunk_s = len(chunk) / 2.0 / MIC_RATE
+            burst_audio_s += chunk_s
+            if dt < chunk_s * 0.5:
+                # Write returned faster than real time — Daily is buffering.
+                fast_count += 1
+                if fast_count % 12 == 1:
+                    logger.info(
+                        "voice/daily: FAST write chunk_s=%.3f took=%.3f "
+                        "burst_audio_s=%.2f wall_s=%.2f qsize=%d",
+                        chunk_s, dt, burst_audio_s,
+                        time.monotonic() - burst_t0, self._out_q.qsize())
 
     async def send_audio(self, pcm: bytes) -> None:
         """Queue agent speech (s16le mono 48 kHz) for the caller."""
@@ -166,11 +194,14 @@ class DailyTransport:
 
     def clear_output(self) -> None:
         """Barge-in: drop all queued (unplayed) agent audio."""
+        dropped = 0
         try:
             while True:
                 self._out_q.get_nowait()
+                dropped += 1
         except queue.Empty:
             pass
+        logger.info("voice/daily: cleared %d queued chunks", dropped)
 
     async def leave(self) -> None:
         self._running = False
