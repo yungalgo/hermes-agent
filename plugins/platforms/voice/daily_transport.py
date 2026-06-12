@@ -25,7 +25,17 @@ upstream demos (demos/audio/wav_audio_send.py, wav_audio_receive.py):
     join(meeting_url, meeting_token=None, client_settings=None,
          completion=None) — completion(JoinData, CallClientError);
     leave(completion=None) — completion(CallClientError);
-    update_subscription_profiles(profile_settings, completion=None).
+    update_subscription_profiles(profile_settings, completion=None);
+    participants() — mapping keyed by participant id (the local
+    participant under the "local" key), each value carrying
+    {"id": ..., "info": {"isLocal": bool, ...}, ...}.
+  - daily.EventHandler — subclass and pass to CallClient(event_handler=);
+    callbacks are invoked on daily-python's internal event thread:
+      on_participant_joined(participant)        (remote participants)
+      on_participant_left(participant, reason)
+      on_call_state_updated(state)              ("joining"/"joined"/
+                                                 "leaving"/"left")
+      on_error(message)
   - client_settings mic selection shape (wav_audio_send.py):
     {"inputs": {"camera": False, "microphone":
         {"isEnabled": True, "settings": {"deviceId": <name>}}}}
@@ -61,6 +71,38 @@ _init_lock = threading.Lock()
 _initialized = False
 _mic = None
 _speaker = None
+
+
+def _is_local_participant(key: str, participant: dict) -> bool:
+    """True for the agent's own entry in participants()/events. The local
+    participant appears under the "local" key in participants() and carries
+    info.isLocal in event payloads."""
+    if key == "local":
+        return True
+    info = participant.get("info") or {}
+    return bool(info.get("isLocal"))
+
+
+def _make_event_handler(transport: "DailyTransport"):
+    """EventHandler subclass wired to *transport* (deferred daily import so
+    the module stays importable without the SDK). Callbacks arrive on
+    daily-python's internal event thread — handlers must be thread-safe."""
+    from daily import EventHandler
+
+    class _TransportEvents(EventHandler):
+        def on_participant_joined(self, participant) -> None:
+            transport._on_participant_joined(participant)
+
+        def on_participant_left(self, participant, reason) -> None:
+            transport._on_participant_left(participant, reason)
+
+        def on_call_state_updated(self, state) -> None:
+            transport._on_call_state_updated(state)
+
+        def on_error(self, message) -> None:
+            transport._on_client_error(message)
+
+    return _TransportEvents()
 
 
 def _ensure_daily() -> None:
@@ -99,6 +141,18 @@ class DailyTransport:
         self._joined = threading.Event()
         self._join_error: Optional[str] = None
         self._last_audio_in_t = 0.0
+        # Presence + lifecycle state for the adapter's call watchdog
+        # (ENG-555 cost leak: abandoned calls kept the billable ASR stream
+        # alive forever). Mutated from daily-python's event thread.
+        self._presence_lock = threading.Lock()
+        self._remote_ids: set = set()
+        self._leaving = False
+        self._abnormal_end: Optional[str] = None
+        # Teardown gate: set the moment teardown starts, BEFORE the call is
+        # left, so the DTX keep-alive stops feeding billable silence into
+        # the ASR stream immediately (the keep-alive thread must never
+        # outlive the call).
+        self._teardown = threading.Event()
         # Telemetry write mark (notes §16 first_frame_written): the turn
         # loop arms it at the start of a turn cycle; the writer thread
         # stamps the first real frame write after arming.
@@ -108,7 +162,7 @@ class DailyTransport:
     async def join(self, room_url: str, token: str, timeout: float = 15.0) -> None:
         _ensure_daily()
         from daily import CallClient
-        self._client = CallClient()
+        self._client = CallClient(event_handler=_make_event_handler(self))
         self._client.update_subscription_profiles(_SUBSCRIPTION_PROFILES)
 
         def _on_join(data, error):
@@ -138,6 +192,14 @@ class DailyTransport:
             self._client.release()
             self._client = None
             raise RuntimeError(f"Daily join failed: {self._join_error}")
+        # Seed presence from the post-join roster: a human may already be
+        # waiting in the room when the agent joins (their joined event fired
+        # before our handler existed).
+        participants = self._client.participants()
+        with self._presence_lock:
+            for key, part in participants.items():
+                if not _is_local_participant(key, part):
+                    self._remote_ids.add(part.get("id") or key)
         self._running = True
         self._last_audio_in_t = time.monotonic()
         self._reader = threading.Thread(
@@ -151,6 +213,56 @@ class DailyTransport:
         self._writer.start()
         self._keepalive.start()
         logger.info("voice/daily: joined %s", room_url)
+
+    # -- presence + call-state events (daily-python event thread) ----------
+
+    def _on_participant_joined(self, participant) -> None:
+        if _is_local_participant("", participant or {}):
+            return
+        pid = (participant or {}).get("id")
+        if pid is None:
+            return
+        with self._presence_lock:
+            self._remote_ids.add(pid)
+            count = len(self._remote_ids)
+        logger.info("voice/daily: participant joined id=%s remote_count=%d",
+                    pid, count)
+
+    def _on_participant_left(self, participant, reason) -> None:
+        pid = (participant or {}).get("id")
+        with self._presence_lock:
+            self._remote_ids.discard(pid)
+            count = len(self._remote_ids)
+        logger.warning(
+            "voice/daily: participant left id=%s reason=%s remote_count=%d",
+            pid, reason, count)
+
+    def _on_call_state_updated(self, state) -> None:
+        logger.info("voice/daily: call state -> %s", state)
+        if state == "left" and not self._leaving:
+            # We did not initiate this: room expired / agent ejected /
+            # connection lost. The adapter watchdog tears the call down.
+            self._abnormal_end = "left"
+            logger.warning(
+                "voice/daily: call ended remotely (ejected/expired) — "
+                "flagging for teardown")
+
+    def _on_client_error(self, message) -> None:
+        self._abnormal_end = f"error: {message}"
+        logger.error("voice/daily: fatal client error: %s", message)
+
+    @property
+    def remote_participant_count(self) -> int:
+        """Remote (non-agent) participants currently in the room."""
+        with self._presence_lock:
+            return len(self._remote_ids)
+
+    @property
+    def abnormal_end(self) -> Optional[str]:
+        """Set when the call ended without us leaving: "left" (ejection /
+        room expiry) or "error: ..." (fatal client error). None while the
+        call is healthy."""
+        return self._abnormal_end
 
     def _read_loop(self) -> None:
         while self._running:
@@ -171,10 +283,14 @@ class DailyTransport:
         # probabilities (observed live 2026-06-12: false barge-ins,
         # end-of-turn never firing, sparse step events). This thread feeds
         # synthesized 80ms silence whenever real audio stops flowing.
+        # COST GUARD (ENG-555): this synthesized silence is BILLABLE ASR
+        # input. The _teardown gate stops the feed the moment teardown
+        # starts — without it an abandoned call kept a Gradium session
+        # alive (rotating every 75s) indefinitely.
         silence = b"\x00" * (IN_CHUNK_FRAMES * 2)
-        while self._running:
-            time.sleep(0.08)
-            if not self._running:
+        while self._running and not self._teardown.is_set():
+            self._teardown.wait(0.08)
+            if not self._running or self._teardown.is_set():
                 return
             if time.monotonic() - self._last_audio_in_t >= 0.16:
                 asyncio.run_coroutine_threadsafe(
@@ -250,7 +366,18 @@ class DailyTransport:
             pass
         logger.info("voice/daily: cleared %d queued chunks", dropped)
 
+    def begin_teardown(self) -> None:
+        """Stop feeding billable keep-alive silence IMMEDIATELY. Called by
+        the adapter as the very first teardown step — before the turn loop,
+        STT, and transport are wound down (each of which can await) — so no
+        more ASR audio is paid for past this point."""
+        if not self._teardown.is_set():
+            self._teardown.set()
+            logger.info("voice/daily: teardown begun — keep-alive stopped")
+
     async def leave(self) -> None:
+        self._teardown.set()
+        self._leaving = True
         self._running = False
         self.clear_output()
         if self._client is not None:

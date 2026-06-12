@@ -8,6 +8,7 @@ plugin registration, requirement checks, and the adapter lifecycle.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -26,6 +27,15 @@ VALID_MODES = {"standalone", "orchestrated"}
 
 DAILY_API = "https://api.daily.co/v1"
 STANDALONE_ROOM_TTL_S = 3600
+
+# Call watchdog (ENG-555 cost leak): an abandoned call — tab closed, or the
+# room expired and ejected the agent — used to leave the billable Gradium
+# ASR stream running indefinitely (the DTX keep-alive fed it silence
+# forever, rotating sessions every 75s). The watchdog tears the call down
+# when humans are gone, the call ended remotely, or a hard age cap is hit.
+DEFAULT_IDLE_TEARDOWN_S = 60.0   # extra.idle_teardown_s
+DEFAULT_MAX_CALL_S = 1800.0      # extra.max_call_s
+WATCHDOG_POLL_S = 0.5
 
 
 def _voice_modules():
@@ -74,6 +84,18 @@ def check_requirements() -> bool:
     if not _daily_available() or not _websockets_available():
         return False
     return bool(os.getenv("GRADIUM_API_KEY", "").strip())
+
+
+def _resolve_float_extra(extra: Dict[str, Any], key: str, default: float) -> float:
+    raw = extra.get(key)
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        logger.warning("voice: invalid %s=%r; using default %s",
+                       key, raw, default)
+        return default
 
 
 def _resolve_mode(extra: Dict[str, Any]) -> str:
@@ -172,14 +194,14 @@ class VoiceAdapter(BasePlatformAdapter):
         if action == "join_room":
             await self._start_call(event["roomUrl"], event["token"])
         elif action == "leave_room":
-            await self._end_call()
+            await self._end_call("control-leave")
 
     async def _start_call(self, room_url: str, token: str) -> None:
         (_, daily_transport, gradium_stt, gradium_tts, turn_loop,
          vamp_mod) = _voice_modules()
         async with self._call_lock:
             if self._active_call is not None:
-                await self._end_call_locked()
+                await self._end_call_locked("replaced-by-new-call")
             loop = asyncio.get_running_loop()
             api_key = os.environ["GRADIUM_API_KEY"]
             extra = self.config.extra or {}
@@ -220,18 +242,85 @@ class VoiceAdapter(BasePlatformAdapter):
             task = asyncio.create_task(vloop.run())
             self._active_call = {
                 "stt": stt, "transport": transport, "loop": vloop,
-                "task": task, "vamp": vamp_cache}
+                "task": task, "vamp": vamp_cache,
+                "started_at": time.monotonic(), "room_url": room_url}
+            self._active_call["watchdog"] = asyncio.create_task(
+                self._call_watchdog(transport))
             logger.info("voice: call started in %s", room_url)
 
-    async def _end_call(self) -> None:
-        async with self._call_lock:
-            await self._end_call_locked()
+    async def _call_watchdog(self, transport) -> None:
+        """Tear the call down when it is no longer worth paying for:
+          - no human (remote) participant for extra.idle_teardown_s
+            (tab closed / never joined),
+          - the call ended remotely (room expired, agent ejected, fatal
+            client error),
+          - call age exceeds extra.max_call_s (hard cost cap).
+        Polls every WATCHDOG_POLL_S; "immediate" paths fire on the next
+        poll. asr_seconds_est in the teardown summary makes the cost of
+        every call auditable."""
+        extra = self.config.extra or {}
+        idle_teardown_s = _resolve_float_extra(
+            extra, "idle_teardown_s", DEFAULT_IDLE_TEARDOWN_S)
+        max_call_s = _resolve_float_extra(
+            extra, "max_call_s", DEFAULT_MAX_CALL_S)
+        idle_since: Optional[float] = None
+        while True:
+            await asyncio.sleep(WATCHDOG_POLL_S)
+            call = self._active_call
+            if call is None or call.get("transport") is not transport:
+                return
+            now = time.monotonic()
+            age_s = now - call["started_at"]
+            reason = None
+            abnormal = transport.abnormal_end
+            if abnormal is not None:
+                reason = "remote-end"
+                logger.warning(
+                    "voice: WATCHDOG teardown reason=%s detail=%r age_s=%.0f "
+                    "— call ended remotely (ejection/expiry/error)",
+                    reason, abnormal, age_s)
+            elif age_s >= max_call_s:
+                reason = "max-call-duration"
+                logger.warning(
+                    "voice: WATCHDOG teardown reason=%s age_s=%.0f "
+                    "max_call_s=%.0f — hard cost cap hit",
+                    reason, age_s, max_call_s)
+            elif transport.remote_participant_count == 0:
+                if idle_since is None:
+                    idle_since = now
+                elif now - idle_since >= idle_teardown_s:
+                    reason = "no-human-participants"
+                    logger.warning(
+                        "voice: WATCHDOG teardown reason=%s idle_s=%.0f "
+                        "idle_teardown_s=%.0f age_s=%.0f — caller gone "
+                        "(tab closed / never joined)",
+                        reason, now - idle_since, idle_teardown_s, age_s)
+            else:
+                idle_since = None
+            if reason is not None:
+                await self._end_call(reason)
+                return
 
-    async def _end_call_locked(self) -> None:
+    async def _end_call(self, reason: str) -> None:
+        async with self._call_lock:
+            await self._end_call_locked(reason)
+
+    async def _end_call_locked(self, reason: str) -> None:
         call = self._active_call
         if call is None:
             return
         self._active_call = None
+        # FIRST: kill the billable keep-alive feed. Every await below can
+        # take real time, and the keep-alive must not pump paid ASR audio
+        # while the call winds down.
+        call["transport"].begin_teardown()
+        watchdog = call.get("watchdog")
+        if watchdog is not None and watchdog is not asyncio.current_task():
+            watchdog.cancel()
+            try:
+                await watchdog
+            except (asyncio.CancelledError, Exception):
+                pass
         vamp_cache = call.get("vamp")
         if vamp_cache is not None:
             await vamp_cache.stop()
@@ -243,7 +332,15 @@ class VoiceAdapter(BasePlatformAdapter):
             pass
         await call["stt"].stop()
         await call["transport"].leave()
-        logger.info("voice: call ended")
+        summary = {
+            "event": "voice_call_teardown",
+            "reason": reason,
+            "room_url": call.get("room_url"),
+            "call_s": round(time.monotonic() - call["started_at"], 1),
+            "asr_seconds_est": round(call["stt"].asr_seconds_est, 1),
+        }
+        logger.info("voice/telemetry %s", json.dumps(summary))
+        logger.info("voice: call ended reason=%s", reason)
 
     async def _create_standalone_room(self) -> Tuple[str, str]:
         import httpx
@@ -271,7 +368,7 @@ class VoiceAdapter(BasePlatformAdapter):
         if self._control is not None:
             await self._control.stop()
             self._control = None
-        await self._end_call()
+        await self._end_call("adapter-disconnect")
 
     async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
         """Out-of-band sends (cron etc.): speak if a call is live.

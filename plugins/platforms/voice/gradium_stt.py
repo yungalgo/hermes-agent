@@ -82,6 +82,7 @@ class _Session:
         self._next_flush_id = next_flush_id
         self.total_duration_s = 0.0
         self.closed = False
+        self.wall_clock_banked = False
         self.opened_at = 0.0
         self.last_step_t = 0.0
         self.last_audio_sent_t = 0.0
@@ -170,6 +171,27 @@ class GradiumSTT:
         # Call-scoped flush counter: monotonic across session rotations so a
         # flush id is never reused and stale acks can never match a new wait.
         self._flush_seq = 0
+        # Billable-cost telemetry (ENG-555): Gradium bills ASR sessions on
+        # WALL CLOCK, so the per-call estimate is the sum of every session's
+        # open->close lifetime (closed sessions banked here, the live one
+        # added on read).
+        self._asr_seconds_closed = 0.0
+
+    def _bank_session_wall_clock(self, s: "_Session") -> None:
+        if s.wall_clock_banked or not s.opened_at:
+            return
+        s.wall_clock_banked = True
+        self._asr_seconds_closed += max(0.0, time.monotonic() - s.opened_at)
+
+    @property
+    def asr_seconds_est(self) -> float:
+        """Estimated billable ASR wall-clock seconds for this call: sum of
+        all closed sessions' lifetimes plus the live session's current age."""
+        total = self._asr_seconds_closed
+        s = self._session
+        if s is not None and not s.wall_clock_banked and s.opened_at:
+            total += max(0.0, time.monotonic() - s.opened_at)
+        return total
 
     def _next_flush_id(self) -> int:
         self._flush_seq += 1
@@ -220,6 +242,7 @@ class GradiumSTT:
             await fresh.open()
             self._session = fresh
             await old.close()
+            self._bank_session_wall_clock(old)
         finally:
             self._rotating = False
 
@@ -266,3 +289,4 @@ class GradiumSTT:
             self._watchdog = None
         if self._session is not None:
             await self._session.close()
+            self._bank_session_wall_clock(self._session)

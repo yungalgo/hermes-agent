@@ -4,6 +4,7 @@ gates, and the VoiceAdapter connect/disconnect lifecycle in both modes."""
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import types
 from types import SimpleNamespace
@@ -90,6 +91,7 @@ class FakeSTT:
         self.api_key = api_key
         self.started = False
         self.stopped = False
+        self.asr_seconds_est = 0.0
 
     async def start(self):
         self.started = True
@@ -108,9 +110,16 @@ class FakeTransport:
         self.on_audio_in = on_audio_in
         self.joined = None
         self.left = False
+        # Watchdog inputs (real transport: presence events + call state).
+        self.remote_participant_count = 0
+        self.abnormal_end = None
+        self.teardown_begun = False
 
     async def join(self, room_url, token):
         self.joined = (room_url, token)
+
+    def begin_teardown(self):
+        self.teardown_begun = True
 
     async def leave(self):
         self.left = True
@@ -183,6 +192,9 @@ class FakeModules:
         self.tts_turns = []
         self.turn_loops = []
         self.vamps = []
+        # Cross-object teardown ordering (ENG-555: the billable keep-alive
+        # must be stopped BEFORE the slow pipeline winddown).
+        self.teardown_events = []
 
         outer = self
 
@@ -196,10 +208,22 @@ class FakeModules:
                 super().__init__(*a, **kw)
                 outer.stts.append(self)
 
+            async def stop(self):
+                await super().stop()
+                outer.teardown_events.append("stt.stop")
+
         class _Transport(FakeTransport):
             def __init__(self, *a, **kw):
                 super().__init__(*a, **kw)
                 outer.transports.append(self)
+
+            def begin_teardown(self):
+                super().begin_teardown()
+                outer.teardown_events.append("transport.begin_teardown")
+
+            async def leave(self):
+                await super().leave()
+                outer.teardown_events.append("transport.leave")
 
         class _TTSTurn(FakeTTSTurn):
             def __init__(self, *a, **kw):
@@ -210,6 +234,10 @@ class FakeModules:
             def __init__(self, *a, **kw):
                 super().__init__(*a, **kw)
                 outer.turn_loops.append(self)
+
+            async def stop(self):
+                await super().stop()
+                outer.teardown_events.append("loop.stop")
 
         class _Vamp(FakeVampCache):
             def __init__(self, *a, **kw):
@@ -469,4 +497,151 @@ async def test_vamp_disabled_by_config(fake_modules, monkeypatch):
          "token": "t1"})
     assert fake_modules.vamps == []
     assert fake_modules.turn_loops[0].vamp is None
+    await adapter.disconnect()
+
+
+# ---------------------------------------------------------------------------
+# Call watchdog (ENG-555: abandoned calls must never keep billing ASR)
+# ---------------------------------------------------------------------------
+
+
+async def _eventually(cond, timeout=2.0):
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not cond():
+        if asyncio.get_running_loop().time() > deadline:
+            raise AssertionError("condition not met within %.1fs" % timeout)
+        await asyncio.sleep(0.01)
+
+
+def _teardown_summary(caplog):
+    """Parse the voice_call_teardown telemetry JSON line from the logs."""
+    for record in caplog.records:
+        msg = record.getMessage()
+        if "voice_call_teardown" in msg:
+            return json.loads(msg.split("voice/telemetry ", 1)[1])
+    return None
+
+
+async def _joined_adapter(fake_modules, monkeypatch, extra):
+    monkeypatch.setattr(_voice, "WATCHDOG_POLL_S", 0.01)
+    adapter = _orchestrated_adapter(monkeypatch, extra=extra)
+    await adapter.connect()
+    await fake_modules.control_channels[0].on_event(
+        {"action": "join_room", "roomUrl": "https://x.daily.co/r1",
+         "token": "t1"})
+    return adapter
+
+
+def _call_torn_down(adapter, fake_modules):
+    return (adapter._active_call is None
+            and fake_modules.turn_loops[0].stopped
+            and fake_modules.stts[0].stopped
+            and fake_modules.transports[0].left)
+
+
+@pytest.mark.asyncio
+async def test_watchdog_tears_down_after_humans_leave(
+        fake_modules, monkeypatch, caplog):
+    """Tab-abandon: the caller's participant drops to 0 and never comes
+    back -> full teardown once idle_teardown_s elapses."""
+    caplog.set_level("INFO")
+    adapter = await _joined_adapter(
+        fake_modules, monkeypatch,
+        extra={"idle_teardown_s": 0.2, "max_call_s": 60})
+    transport = fake_modules.transports[0]
+    transport.remote_participant_count = 1
+    # A present human holds the call open well past the idle window.
+    await asyncio.sleep(0.4)
+    assert adapter._active_call is not None
+    # Tab closed: participants drop to 0 and stay there.
+    transport.remote_participant_count = 0
+    await _eventually(lambda: _call_torn_down(adapter, fake_modules))
+    assert transport.teardown_begun is True
+    summary = _teardown_summary(caplog)
+    assert summary["reason"] == "no-human-participants"
+    await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_watchdog_idle_clock_resets_when_human_returns(
+        fake_modules, monkeypatch):
+    """A brief participant gap (reconnect blip) must not end the call."""
+    adapter = await _joined_adapter(
+        fake_modules, monkeypatch,
+        extra={"idle_teardown_s": 0.3, "max_call_s": 60})
+    transport = fake_modules.transports[0]
+    transport.remote_participant_count = 1
+    await asyncio.sleep(0.05)
+    transport.remote_participant_count = 0      # blip starts
+    await asyncio.sleep(0.1)                    # under the idle window
+    transport.remote_participant_count = 1      # human came back
+    await asyncio.sleep(0.4)                    # idle clock must have reset
+    assert adapter._active_call is not None
+    await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_watchdog_remote_end_tears_down_immediately(
+        fake_modules, monkeypatch, caplog):
+    """Ejection (room expiry / kicked): the transport flags abnormal_end
+    and the watchdog ends the call on the next poll — no idle wait."""
+    caplog.set_level("INFO")
+    adapter = await _joined_adapter(
+        fake_modules, monkeypatch,
+        extra={"idle_teardown_s": 30, "max_call_s": 60})
+    transport = fake_modules.transports[0]
+    transport.remote_participant_count = 1
+    transport.abnormal_end = "left"
+    await _eventually(lambda: _call_torn_down(adapter, fake_modules),
+                      timeout=1.0)   # far below idle_teardown_s
+    summary = _teardown_summary(caplog)
+    assert summary["reason"] == "remote-end"
+    await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_watchdog_enforces_max_call_duration(
+        fake_modules, monkeypatch, caplog):
+    """The hard age cap fires even with a human still on the call."""
+    caplog.set_level("INFO")
+    adapter = await _joined_adapter(
+        fake_modules, monkeypatch,
+        extra={"idle_teardown_s": 30, "max_call_s": 0.1})
+    fake_modules.transports[0].remote_participant_count = 1
+    await _eventually(lambda: _call_torn_down(adapter, fake_modules))
+    summary = _teardown_summary(caplog)
+    assert summary["reason"] == "max-call-duration"
+    await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_teardown_summary_reports_asr_cost(
+        fake_modules, monkeypatch, caplog):
+    """Every teardown emits an auditable per-call summary with the
+    estimated billable ASR wall-clock."""
+    caplog.set_level("INFO")
+    adapter = await _joined_adapter(
+        fake_modules, monkeypatch, extra={})
+    fake_modules.stts[0].asr_seconds_est = 123.4
+    await fake_modules.control_channels[0].on_event({"action": "leave_room"})
+    summary = _teardown_summary(caplog)
+    assert summary["reason"] == "control-leave"
+    assert summary["asr_seconds_est"] == 123.4
+    assert summary["room_url"] == "https://x.daily.co/r1"
+    assert summary["call_s"] >= 0
+    await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_teardown_stops_keepalive_before_pipeline_winddown(
+        fake_modules, monkeypatch):
+    """Ordering (ENG-555): begin_teardown (kills the billable keep-alive
+    feed) must run FIRST — before the turn loop, STT, and transport leave,
+    each of which can await for real time."""
+    adapter = await _joined_adapter(fake_modules, monkeypatch, extra={})
+    await fake_modules.control_channels[0].on_event({"action": "leave_room"})
+    events = fake_modules.teardown_events
+    assert events[0] == "transport.begin_teardown"
+    assert events.index("loop.stop") < events.index("stt.stop")
+    assert events.index("stt.stop") < events.index("transport.leave")
     await adapter.disconnect()

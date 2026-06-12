@@ -7,6 +7,7 @@ import asyncio
 import base64
 import json
 import sys
+import types
 
 import pytest
 
@@ -259,6 +260,34 @@ async def test_no_deaf_rotation_while_steps_flow(fake_ws, monkeypatch):
         await asyncio.sleep(0.02)
     assert stt._session is first
     await stt.stop()
+
+
+@pytest.mark.asyncio
+async def test_asr_seconds_est_sums_session_wall_clock(fake_ws, monkeypatch):
+    """Cost telemetry (ENG-555): Gradium bills ASR sessions on wall clock,
+    so the per-call estimate is the sum of every session's open->close
+    lifetime — including across rotations — plus the live session's age."""
+    clock = {"t": 1000.0}
+    # Shadow the module's `time` binding only (patching time.monotonic
+    # itself would freeze the event loop's clock).
+    monkeypatch.setattr(
+        gradium_stt, "time",
+        types.SimpleNamespace(monotonic=lambda: clock["t"]))
+    stt = gradium_stt.GradiumSTT("g-key")
+    assert stt.asr_seconds_est == 0.0       # nothing opened yet
+    await stt.start()
+    clock["t"] += 30.0                      # live session: 30s so far
+    assert stt.asr_seconds_est == pytest.approx(30.0)
+    first = stt._session
+    first.total_duration_s = 250.0
+    await stt.maybe_rotate({"vad": _vad(0.95)})   # rotation banks 30s
+    assert stt._session is not first
+    clock["t"] += 12.0                      # second session: 12s so far
+    assert stt.asr_seconds_est == pytest.approx(42.0)
+    await stt.stop()                        # stop banks the live session
+    assert stt.asr_seconds_est == pytest.approx(42.0)
+    clock["t"] += 100.0                     # time after stop never bills
+    assert stt.asr_seconds_est == pytest.approx(42.0)
 
 
 @pytest.mark.asyncio

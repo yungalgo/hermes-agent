@@ -46,10 +46,22 @@ class FakeSpeaker:
             return b""
 
 
+class FakeEventHandler:
+    """Stands in for daily.EventHandler (the SDK base class the transport
+    subclasses for participant/call-state events)."""
+
+    def __init__(self):
+        pass
+
+
 class FakeCallClient:
     # "ok" -> join succeeds; "error" -> completion gets an error;
     # "hang" -> completion never fires (join timeout path).
     join_behavior = "ok"
+    # participants() roster returned after join (overridden per-test to
+    # simulate a human already waiting in the room).
+    initial_participants = {
+        "local": {"id": "agent-id", "info": {"isLocal": True}}}
 
     def __init__(self, event_handler=None):
         self.event_handler = event_handler
@@ -57,6 +69,9 @@ class FakeCallClient:
         self.subscription_profiles = None
         self.left = False
         self.released = False
+
+    def participants(self):
+        return dict(self.initial_participants)
 
     def update_subscription_profiles(self, profile_settings, completion=None):
         self.subscription_profiles = profile_settings
@@ -120,8 +135,11 @@ def fake_daily(monkeypatch):
     fake_module = type(sys)("daily")
     fake_module.Daily = FakeDaily
     fake_module.CallClient = FakeCallClient
+    fake_module.EventHandler = FakeEventHandler
     monkeypatch.setitem(sys.modules, "daily", fake_module)
     monkeypatch.setattr(FakeCallClient, "join_behavior", "ok")
+    monkeypatch.setattr(FakeCallClient, "initial_participants",
+                        FakeCallClient.initial_participants)
     monkeypatch.setattr(daily_transport, "_initialized", False)
     monkeypatch.setattr(daily_transport, "_mic", None)
     monkeypatch.setattr(daily_transport, "_speaker", None)
@@ -270,9 +288,153 @@ async def test_leave_tears_down_client_and_threads(fake_daily):
     await transport.join("https://x.daily.co/room", "tok-1")
     client = transport._client
     reader, writer = transport._reader, transport._writer
+    keepalive = transport._keepalive
     await transport.leave()
     assert client.left is True
     assert client.released is True
     assert transport._client is None
+    # The keep-alive thread feeds BILLABLE ASR silence — it must never
+    # outlive the call (ENG-555 cost leak).
     await _eventually(
-        lambda: not reader.is_alive() and not writer.is_alive(), timeout=3.0)
+        lambda: (not reader.is_alive() and not writer.is_alive()
+                 and not keepalive.is_alive()), timeout=3.0)
+
+
+# ---------------------------------------------------------------------------
+# Presence + call-state events (ENG-555 abandoned-call watchdog inputs)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_join_wires_event_handler_into_call_client(fake_daily):
+    transport = _make_transport()
+    await transport.join("https://x.daily.co/room", "tok-1")
+    try:
+        handler = transport._client.event_handler
+        assert handler is not None
+        # The handler is a daily.EventHandler subclass (SDK requirement).
+        assert isinstance(handler, FakeEventHandler)
+    finally:
+        await transport.leave()
+
+
+@pytest.mark.asyncio
+async def test_remote_participant_count_tracks_join_and_leave(fake_daily):
+    transport = _make_transport()
+    await transport.join("https://x.daily.co/room", "tok-1")
+    try:
+        handler = transport._client.event_handler
+        assert transport.remote_participant_count == 0
+        handler.on_participant_joined(
+            {"id": "human-1", "info": {"isLocal": False, "userName": "yung"}})
+        assert transport.remote_participant_count == 1
+        # The agent's own (local) entry never counts as a human.
+        handler.on_participant_joined(
+            {"id": "agent-id", "info": {"isLocal": True}})
+        assert transport.remote_participant_count == 1
+        # Duplicate join events do not double-count.
+        handler.on_participant_joined(
+            {"id": "human-1", "info": {"isLocal": False}})
+        assert transport.remote_participant_count == 1
+        handler.on_participant_left(
+            {"id": "human-1", "info": {"isLocal": False}}, "leftCall")
+        assert transport.remote_participant_count == 0
+        # A leave for an unknown id is harmless.
+        handler.on_participant_left({"id": "ghost"}, "leftCall")
+        assert transport.remote_participant_count == 0
+    finally:
+        await transport.leave()
+
+
+@pytest.mark.asyncio
+async def test_presence_seeded_from_post_join_roster(fake_daily, monkeypatch):
+    """A human already waiting in the room when the agent joins (their
+    joined event fired before our handler existed) must be counted."""
+    monkeypatch.setattr(FakeCallClient, "initial_participants", {
+        "local": {"id": "agent-id", "info": {"isLocal": True}},
+        "human-7": {"id": "human-7", "info": {"isLocal": False}},
+    })
+    transport = _make_transport()
+    await transport.join("https://x.daily.co/room", "tok-1")
+    try:
+        assert transport.remote_participant_count == 1
+    finally:
+        await transport.leave()
+
+
+@pytest.mark.asyncio
+async def test_remote_left_state_marks_abnormal_end(fake_daily):
+    """Room expiry / ejection: the call state flips to "left" WITHOUT us
+    calling leave(). The transport must flag it for the adapter watchdog."""
+    transport = _make_transport()
+    await transport.join("https://x.daily.co/room", "tok-1")
+    try:
+        handler = transport._client.event_handler
+        assert transport.abnormal_end is None
+        handler.on_call_state_updated("joined")
+        assert transport.abnormal_end is None
+        handler.on_call_state_updated("left")
+        assert transport.abnormal_end == "left"
+    finally:
+        await transport.leave()
+
+
+@pytest.mark.asyncio
+async def test_local_leave_left_state_is_not_abnormal(fake_daily):
+    transport = _make_transport()
+    await transport.join("https://x.daily.co/room", "tok-1")
+    handler = transport._client.event_handler
+    await transport.leave()
+    # The "left" state caused by OUR leave() must not look like an ejection.
+    handler.on_call_state_updated("left")
+    assert transport.abnormal_end is None
+
+
+@pytest.mark.asyncio
+async def test_client_error_marks_abnormal_end(fake_daily):
+    transport = _make_transport()
+    await transport.join("https://x.daily.co/room", "tok-1")
+    try:
+        transport._client.event_handler.on_error("connection lost")
+        assert transport.abnormal_end == "error: connection lost"
+    finally:
+        await transport.leave()
+
+
+# ---------------------------------------------------------------------------
+# Keep-alive teardown ordering (ENG-555: silence into the ASR is billable)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_begin_teardown_stops_keepalive_silence_immediately(fake_daily):
+    received = []
+
+    async def on_audio_in(pcm: bytes) -> None:
+        received.append(pcm)
+
+    transport = _make_transport(on_audio_in)
+    await transport.join("https://x.daily.co/room", "tok-1")
+    try:
+        # Keep-alive silence is flowing (DTX gap, no real frames).
+        await _eventually(lambda: len(received) >= 3, timeout=3.0)
+        keepalive = transport._keepalive
+        transport.begin_teardown()
+        # The keep-alive thread exits promptly — it must not keep feeding
+        # billable silence while the (slow) teardown awaits run.
+        await _eventually(lambda: not keepalive.is_alive(), timeout=2.0)
+        fed_after_teardown = len(received)
+        await asyncio.sleep(0.3)
+        assert len(received) == fed_after_teardown
+    finally:
+        await transport.leave()
+
+
+@pytest.mark.asyncio
+async def test_begin_teardown_is_idempotent_and_leave_still_works(fake_daily):
+    transport = _make_transport()
+    await transport.join("https://x.daily.co/room", "tok-1")
+    transport.begin_teardown()
+    transport.begin_teardown()
+    await transport.leave()
+    assert transport._client is None

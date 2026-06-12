@@ -732,6 +732,9 @@ platform_toolsets:
 #       filler_text: "One moment."  # spoken when a tool call starts
 #       max_turns: 90               # per-utterance agent tool-loop cap (default HERMES_MAX_ITERATIONS or 90)
 #       model: ""                   # voice-turn model override (empty = gateway model)
+#       idle_teardown_s: 60         # end the call after this many seconds with no human participant
+#                                   # (tab closed / never joined) — stops billable ASR on abandoned calls
+#       max_call_s: 1800            # hard cap on call duration in seconds (cost guard)
 #       barge_energy_chunks: 2      # consecutive hot 80ms chunks to barge in (1 = experimental fast trigger)
 #       # Vamp: pre-synthesized acknowledgment clips ("Mm — let me think.")
 #       # played on a fast end-of-turn signal so the caller hears audio
