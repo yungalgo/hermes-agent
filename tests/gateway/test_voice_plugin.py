@@ -98,7 +98,8 @@ class FakeSTT:
         self.stopped = True
 
     async def send_audio(self, pcm):
-        pass
+        self.audio_chunks = getattr(self, "audio_chunks", [])
+        self.audio_chunks.append(pcm)
 
 
 class FakeTransport:
@@ -149,6 +150,10 @@ class FakeVoiceTurnLoop:
     async def stop(self):
         self.stopped = True
         self._stop_event.set()
+
+    async def on_inbound_audio(self, pcm):
+        self.inbound_chunks = getattr(self, "inbound_chunks", [])
+        self.inbound_chunks.append(pcm)
 
 
 class FakeModules:
@@ -233,8 +238,11 @@ async def test_orchestrated_connect_subscribes_and_join_room_starts_call(
     assert fake_modules.stts[0].started is True
     assert fake_modules.stts[0].api_key == "g-test"
     assert fake_modules.transports[0].joined == ("https://x.daily.co/r1", "t1")
-    # the transport feeds caller audio straight into the STT
-    assert fake_modules.transports[0].on_audio_in == fake_modules.stts[0].send_audio
+    # the transport fans caller audio out to the STT AND the turn loop's
+    # local energy barge-in
+    await fake_modules.transports[0].on_audio_in(b"\x01\x02")
+    assert getattr(fake_modules.stts[0], "audio_chunks", []) == [b"\x01\x02"]
+    assert getattr(fake_modules.turn_loops[0], "inbound_chunks", []) == [b"\x01\x02"]
     assert fake_modules.turn_loops[0].extra["mode"] == "orchestrated"
 
     # the tts_factory wired into the loop opens a per-turn Gradium socket

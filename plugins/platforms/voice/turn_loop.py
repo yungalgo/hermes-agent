@@ -30,23 +30,49 @@ Live-verified Gradium facts this loop relies on (notes §15):
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
 import os
 import re
 import threading
+import time
 import uuid
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# Mirrors tools/tts_tool.py:2426 / 2524 / 2525.
-_SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?])(?:\s|\n)|(?:\n\n)")
-MIN_SENTENCE_LEN = 20
+# Sentence-final punctuation: used to track how much UNSYNTHESIZED text the
+# TTS server is holding (it only synthesizes on [.!?] or an explicit
+# <flush>); long punctuation-free stretches get a forced flush on idle.
+_PUNCT_RE = re.compile(r"[.!?]")
 LONG_FLUSH_LEN = 100
 
 END_OF_TURN_HORIZON = 2.0
 END_OF_TURN_PROB = 0.7
+# Barge-in on VAD evidence of user speech during THINKING/SPEAKING: the
+# short-horizon inactivity probability collapses within ~1-2 steps of real
+# speech, while finalized `text` events can lag seconds behind (live
+# measurement 2026-06-12: 2-8s during overlapping speech). N consecutive
+# speech-positive steps guard against one-step blips/echo.
+BARGE_VAD_HORIZON = 0.5
+BARGE_VAD_SPEECH_PROB = 0.5
+BARGE_VAD_CONSEC_STEPS = 2
+# Local energy trigger on inbound caller PCM (s16le mono): the Gradium VAD
+# round-trip costs 0.6-1.8s during overlapping speech (measured live
+# 2026-06-12); raw input energy is available instantly. N consecutive 80ms
+# chunks above the RMS floor = user is talking over the agent. Daily/browser
+# AEC + noise suppression keep agent echo and room noise below this floor;
+# the slower VAD/text triggers remain as fallback.
+ENERGY_BARGE_RMS = 500
+# Two 80ms chunks: a bare "Wait—" is exactly 2 hot chunks before its
+# inter-word dip (measured on the synthetic barge utterance); 4 chunks
+# missed it entirely and lost the race to the ~700ms server-side VAD.
+ENERGY_BARGE_CHUNKS = 2
 FLUSHED_WAIT_TIMEOUT_S = 2.0
+# If the first sentence hasn't reached a sentence-final punctuation this
+# long after its first words went to TTS, force a <flush> once so audio
+# starts (prosody costs less than dead air on the first clause).
+FIRST_SENTENCE_FLUSH_S = 0.6
 TTS_END_TIMEOUT_S = 30.0
 # Bound on awaiting the executor-run agent after a turn ends (normally the
 # future is already done; after an interrupt a well-behaved agent returns
@@ -60,6 +86,15 @@ DEFAULT_GREETING_PROMPT = (
 DEFAULT_FILLER_TEXT = "One moment."
 
 LISTENING, THINKING, SPEAKING = "listening", "thinking", "speaking"
+
+
+def _rms(pcm: bytes) -> float:
+    """RMS of s16le mono PCM (audioop-free: removed in Python 3.13).
+    Subsamples every 4th frame — plenty for an 80ms energy gate."""
+    samples = memoryview(pcm).cast("h")[::4]
+    if len(samples) == 0:
+        return 0.0
+    return (sum(s * s for s in samples) / len(samples)) ** 0.5
 
 
 def _resolve_max_iterations(extra: Dict[str, Any]) -> int:
@@ -123,6 +158,20 @@ class VoiceTurnLoop:
         self._history: List[Dict[str, str]] = []
         self._pending_text: List[str] = []
         self._state = LISTENING
+        # VAD speech tracking: consecutive speech-positive steps drive the
+        # fast barge-in trigger; _speech_seen lets end-of-turn finalize even
+        # before the (slow) finalized text has arrived — flush forces it out.
+        self._speech_steps = 0
+        self._speech_seen = False
+        self._energy_hot_chunks = 0
+        # Per-turn delta/tool sinks behind stable trampolines, so an agent
+        # can be CONSTRUCTED before its turn starts (construction overlaps
+        # the flush wait) and still stream into the right turn's queue.
+        self._delta_sink = None
+        self._tool_sink = None
+        # Pre-constructed agent for the next turn (concurrent.futures.Future
+        # from run_in_executor), made while waiting for the STT flush ack.
+        self._spare_agent_future = None
         # One-element list so the executor thread can publish the live agent
         # for cross-thread interrupt (api_server agent_ref pattern, 3505-3508).
         self._agent_ref: List[Optional[Any]] = [None]
@@ -137,13 +186,70 @@ class VoiceTurnLoop:
         self._awaiting_flush_id: Optional[int] = None
         self._last_flushed_id: Optional[int] = None
         self._flushed = asyncio.Event()
+        # Timing instrumentation: per-turn sequence + reference timestamp
+        # (vad-end for user turns; turn-start for the greeting). All
+        # voice/timing logs report ms since this reference.
+        self._turn_seq = 0
+        self._t_ref: Optional[float] = None
+
+    def _mark(self, leg: str, **fields: Any) -> None:
+        """INFO timing log: ms since the current turn's reference point."""
+        now = time.monotonic()
+        ref = self._t_ref if self._t_ref is not None else now
+        extra = "".join(f" {k}={v}" for k, v in fields.items())
+        logger.info("voice/timing turn=%d %s t=+%.0fms%s",
+                    self._turn_seq, leg, (now - ref) * 1000.0, extra)
+
+    # -- agent plumbing -----------------------------------------------------
+
+    def _delta_tramp(self, delta: str) -> None:
+        sink = self._delta_sink
+        if sink is not None:
+            sink(delta)
+
+    def _tool_tramp(self, event_type, tool_name=None, preview=None,
+                    args=None, **kwargs) -> None:
+        sink = self._tool_sink
+        if sink is not None:
+            sink(event_type, tool_name=tool_name, preview=preview,
+                 args=args, **kwargs)
+
+    def _make_agent(self):
+        """Construct a turn agent (executor thread). Construction does not
+        need the user message, so it can run before the turn starts."""
+        return _create_voice_agent(
+            self._session_id, self._delta_tramp, self._tool_tramp,
+            extra=self._extra)
+
+    def _preconstruct_agent(self) -> "concurrent.futures.Future":
+        """Build the next turn's agent on a worker thread. Returns a
+        concurrent Future (thread-safe .result() from the turn executor)."""
+        fut: "concurrent.futures.Future" = concurrent.futures.Future()
+
+        def _build() -> None:
+            try:
+                fut.set_result(self._make_agent())
+            except BaseException as e:    # surface in the consuming turn
+                fut.set_exception(e)
+
+        threading.Thread(
+            target=_build, name="voice-agent-prewarm", daemon=True).start()
+        return fut
 
     # -- main ---------------------------------------------------------------
 
     async def run(self) -> None:
         consumer = asyncio.create_task(self._consume_stt())
-        # Agent speaks first (notes §14 item 8): greeting turn before listening.
-        self._start_turn(self._greeting, record_user=False)
+        canned = self._extra.get("greeting_text")
+        if canned:
+            # Canned greeting: instant TTS, no LLM round-trip. The first
+            # real turn's agent is pre-warmed while the greeting plays.
+            self._spare_agent_future = self._preconstruct_agent()
+            self._turn_task = asyncio.create_task(self._speak_canned(canned))
+        else:
+            # Agent speaks first (notes §14 item 8): greeting turn before
+            # listening.
+            self._start_turn(self._greeting, record_user=False)
         await self._stopped.wait()
         consumer.cancel()
         try:
@@ -164,23 +270,93 @@ class VoiceTurnLoop:
         await self._barge_in()           # kill any in-flight turn
         self._stopped.set()
 
+    async def _speak_canned(self, text: str) -> None:
+        """Speak fixed text through TTS without an agent turn (greeting)."""
+        self._t_ref = time.monotonic()
+        self._mark("canned-greeting-start", chars=len(text))
+        self._state = SPEAKING
+        try:
+            self._tts = await self._tts_factory(self._transport.send_audio)
+            await self._tts.send_text(text)
+            await asyncio.wait_for(self._tts.end(), timeout=TTS_END_TIMEOUT_S)
+            self._history.append({"role": "assistant", "content": text})
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("voice/turn: canned greeting failed")
+        finally:
+            self._tts = None
+            if self._state != LISTENING:
+                self._state = LISTENING
+
+    # -- inbound audio (fast energy barge-in) --------------------------------
+
+    async def on_inbound_audio(self, pcm: bytes) -> None:
+        """Called by the adapter for every inbound 80ms caller chunk, in
+        parallel with STT. Sustained energy while the agent is
+        thinking/speaking barges in WITHOUT waiting for the STT round-trip
+        (0.6-1.8s measured live)."""
+        if self._state not in (THINKING, SPEAKING):
+            self._energy_hot_chunks = 0
+            return
+        if _rms(pcm) >= ENERGY_BARGE_RMS:
+            self._energy_hot_chunks += 1
+        else:
+            self._energy_hot_chunks = 0
+            return
+        if self._energy_hot_chunks >= ENERGY_BARGE_CHUNKS:
+            self._energy_hot_chunks = 0
+            self._mark("barge-in-trigger", source="energy", state=self._state)
+            await self._barge_in()
+
     # -- STT event pump -----------------------------------------------------
 
     async def _consume_stt(self) -> None:
         async for msg in self._stt.events():
             mtype = msg.get("type")
             if mtype == "text":
-                if self._state in (THINKING, SPEAKING):
+                # While finalize awaits the flush ack, text events are the
+                # forced tail of the utterance that ALREADY started the
+                # eager turn — not a new interjection. Finalize handles the
+                # restart; real interruptions in that window are caught by
+                # the (faster) VAD-step trigger below.
+                if (self._state in (THINKING, SPEAKING)
+                        and self._finalize_task is None):
+                    self._mark("barge-in-trigger", source="stt-text",
+                               state=self._state)
                     await self._barge_in()
                 self._pending_text.append(msg.get("text", ""))
             elif mtype == "step":
                 await self._stt.maybe_rotate(msg)
-                if (self._pending_text and self._state == LISTENING
+                # Horizons looked up by value (FOUR arrive live, §15).
+                probs = {v.get("horizon_s"): v.get("inactivity_prob", 0.0)
+                         for v in msg.get("vad", [])}
+                if os.getenv("VOICE_DEBUG_VAD") and any(
+                        0.02 < p < 0.98 for p in probs.values()):
+                    self._mark("vad-step", probs={k: round(v, 3)
+                                                  for k, v in probs.items()})
+                # Fast barge-in: short-horizon inactivity collapsing means
+                # the user is speaking NOW — do not wait for finalized text
+                # (which can lag seconds during overlapping speech).
+                p_short = probs.get(BARGE_VAD_HORIZON)
+                if p_short is not None and p_short <= BARGE_VAD_SPEECH_PROB:
+                    self._speech_steps += 1
+                else:
+                    self._speech_steps = 0
+                if self._speech_steps >= BARGE_VAD_CONSEC_STEPS:
+                    self._speech_seen = True
+                    if self._state in (THINKING, SPEAKING):
+                        self._mark("barge-in-trigger", source="vad-step",
+                                   state=self._state)
+                        await self._barge_in()
+                if ((self._pending_text or self._speech_seen)
+                        and self._state == LISTENING
                         and self._finalize_task is None):
-                    # Horizons looked up by value (FOUR arrive live, §15).
-                    probs = {v.get("horizon_s"): v.get("inactivity_prob", 0.0)
-                             for v in msg.get("vad", [])}
                     if probs.get(END_OF_TURN_HORIZON, 0.0) >= END_OF_TURN_PROB:
+                        self._turn_seq += 1
+                        self._t_ref = time.monotonic()
+                        self._mark("vad-end-detected",
+                                   probs={k: round(v, 3) for k, v in probs.items()})
                         # Run finalize as a task: it waits for the "flushed"
                         # ack, which only THIS consumer loop can deliver.
                         # (Inlining it here deadlocks the ack path and would
@@ -189,6 +365,8 @@ class VoiceTurnLoop:
                             self._finalize_user_turn())
             elif mtype == "flushed":
                 self._last_flushed_id = msg.get("flush_id")
+                self._mark("flushed-raw", msg=msg,
+                           awaiting=self._awaiting_flush_id)
                 if self._last_flushed_id == self._awaiting_flush_id:
                     self._flushed.set()
             elif mtype == "error":
@@ -196,9 +374,30 @@ class VoiceTurnLoop:
 
     async def _finalize_user_turn(self) -> None:
         try:
+            # Pre-construct the turn agent NOW so the ~0.5s construction
+            # overlaps the flush round-trip instead of following it.
+            if self._spare_agent_future is None:
+                self._mark("agent-preconstruct-start")
+                self._spare_agent_future = self._preconstruct_agent()
             self._flushed.clear()
             self._awaiting_flush_id = None
+            # EAGER START: in live measurements the transcript is already
+            # complete at vad-end (the flush round-trip of ~370ms added no
+            # text), so the turn starts NOW with what we have. The flush
+            # below still runs; if it does deliver more text, the eager
+            # turn is interrupted (it cannot have produced audio that fast)
+            # and restarted with the full utterance.
+            eager_text = " ".join(t for t in self._pending_text if t).strip()
+            if eager_text:
+                self._pending_text.clear()
+                self._speech_seen = False
+                self._speech_steps = 0
+                agent_future = self._spare_agent_future
+                self._spare_agent_future = None
+                self._start_turn(eager_text, record_user=True,
+                                 agent_future=agent_future)
             flush_id = await self._stt.flush()
+            self._mark("flush-sent", flush_id=flush_id)
             if flush_id is not None:
                 self._awaiting_flush_id = flush_id
                 # The ack may have been consumed between flush() and the
@@ -207,28 +406,65 @@ class VoiceTurnLoop:
                     try:
                         await asyncio.wait_for(
                             self._flushed.wait(), timeout=FLUSHED_WAIT_TIMEOUT_S)
+                        self._mark("flushed-ack", flush_id=flush_id)
                     except asyncio.TimeoutError:
-                        pass              # proceed with what we have
+                        self._mark("flushed-TIMEOUT", flush_id=flush_id,
+                                   last_seen=self._last_flushed_id)
             # else: no live STT session — no "flushed" event will ever
             # arrive (notes §15 addendum), skip the wait entirely.
-            utterance = " ".join(t for t in self._pending_text if t).strip()
+            late_text = " ".join(t for t in self._pending_text if t).strip()
+            if eager_text and not late_text:
+                return                    # eager turn was complete — done
+            if eager_text and late_text:
+                if self._turn_task is None or self._turn_task.done():
+                    # The eager turn already ended — a real barge-in killed
+                    # it (re-queueing eager_text into pending). Leave the
+                    # accumulated text for the normal flow; restarting here
+                    # would duplicate the utterance mid-speech.
+                    return
+                # Rare: the flush delivered a transcript tail. Restart the
+                # turn with the full utterance (the eager turn cannot have
+                # spoken yet; we rebuild the utterance explicitly).
+                self._mark("eager-restart", extra_chars=len(late_text))
+                await self._barge_in()
+                self._pending_text.clear()
+                self._speech_seen = False
+                self._speech_steps = 0
+                agent_future = self._spare_agent_future
+                self._spare_agent_future = None
+                self._start_turn(f"{eager_text} {late_text}",
+                                 record_user=True, agent_future=agent_future)
+                return
+            utterance = late_text
             self._pending_text.clear()
+            self._speech_seen = False
+            self._speech_steps = 0
             if utterance:
-                self._start_turn(utterance, record_user=True)
+                agent_future = self._spare_agent_future
+                self._spare_agent_future = None
+                self._start_turn(utterance, record_user=True,
+                                 agent_future=agent_future)
+            # else: keep the spare agent for the next finalize.
         finally:
             self._finalize_task = None
 
     # -- agent turn ---------------------------------------------------------
 
-    def _start_turn(self, user_message: str, *, record_user: bool) -> None:
+    def _start_turn(self, user_message: str, *, record_user: bool,
+                    agent_future=None) -> None:
         self._state = THINKING
+        if self._t_ref is None:          # greeting turn has no vad-end
+            self._t_ref = time.monotonic()
+        self._mark("turn-start", chars=len(user_message))
         # Fresh latch BEFORE the task exists so a barge-in can never land
         # between turn creation and the executor publishing the agent.
         self._interrupt_latch = threading.Event()
         self._turn_task = asyncio.create_task(
-            self._execute_turn(user_message, record_user=record_user))
+            self._execute_turn(user_message, record_user=record_user,
+                               agent_future=agent_future))
 
-    async def _execute_turn(self, user_message: str, *, record_user: bool) -> None:
+    async def _execute_turn(self, user_message: str, *, record_user: bool,
+                            agent_future=None) -> None:
         loop = asyncio.get_running_loop()
         q: "asyncio.Queue[tuple]" = asyncio.Queue()
         agent_ref = self._agent_ref
@@ -250,8 +486,13 @@ class VoiceTurnLoop:
                 pass
 
         # Mirrors api_server._delta (1633-1635).
+        first_delta_seen = threading.Event()
+
         def _delta(delta: str) -> None:
             if delta:
+                if not first_delta_seen.is_set():
+                    first_delta_seen.set()
+                    self._mark("first-delta")
                 _enqueue(("delta", delta))
 
         # Signature mirrors api_server._tool_progress (1637).
@@ -260,11 +501,22 @@ class VoiceTurnLoop:
             if event_type == "tool.started":
                 _enqueue(("tool", tool_name))
 
+        # Route the stable trampolines into THIS turn's queue. One live
+        # turn at a time, so plain assignment is safe.
+        self._delta_sink = _delta
+        self._tool_sink = _tool_progress
+
         def _run():
             # Executor body mirrors api_server._run_agent (3510-3554).
-            agent = _create_voice_agent(
-                self._session_id, _delta, _tool_progress, extra=self._extra)
+            if agent_future is not None:
+                # Pre-constructed in finalize; bounded so a hung
+                # construction can never wedge the turn executor forever.
+                agent = agent_future.result(timeout=RUN_FUTURE_TIMEOUT_S)
+            else:
+                self._mark("agent-constructing")
+                agent = self._make_agent()
             agent_ref[0] = agent
+            self._mark("agent-start")
             if interrupt_latch.is_set():
                 # A barge-in/stop landed while the agent was still being
                 # constructed: interrupt before the first iteration runs.
@@ -282,10 +534,25 @@ class VoiceTurnLoop:
                 _enqueue(("done", None))
 
         run_future = loop.run_in_executor(None, _run)
+        # Pre-warm the NEXT turn's agent while this one runs: construction
+        # (~0.5s of config/toolset loading) drops off the critical path of
+        # every subsequent turn.
+        if self._spare_agent_future is None:
+            self._spare_agent_future = self._preconstruct_agent()
 
         interrupted = False
+        first_audio_seen = False
+
+        async def _on_audio(pcm: bytes) -> None:
+            nonlocal first_audio_seen
+            if not first_audio_seen:
+                first_audio_seen = True
+                self._mark("first-tts-audio-chunk", bytes=len(pcm))
+            await self._transport.send_audio(pcm)
+
         try:
-            self._tts = await self._tts_factory(self._transport.send_audio)
+            self._tts = await self._tts_factory(_on_audio)
+            self._mark("tts-socket-open")
             self._state = SPEAKING
             await self._pump_deltas_to_tts(q)
             try:
@@ -327,47 +594,110 @@ class VoiceTurnLoop:
                     self._history.append({"role": "user", "content": user_message})
                 if final:
                     self._history.append({"role": "assistant", "content": final})
+            elif interrupted and record_user and not first_audio_seen:
+                # Barged in before the user heard ANY of the reply: their
+                # words must not vanish — feed them into the next turn.
+                self._pending_text.insert(0, user_message)
             agent_ref[0] = None
+            self._delta_sink = None
+            self._tool_sink = None
             if self._state != LISTENING:
                 self._state = LISTENING
 
     async def _pump_deltas_to_tts(self, q: "asyncio.Queue[tuple]") -> None:
-        """Sentence buffering — mirrors tts_tool.py:2599-2641."""
+        """Stream deltas to TTS at word granularity.
+
+        Gradium only synthesizes on sentence-final punctuation (or an
+        explicit <flush>), so forwarding words as they arrive lets audio
+        start the moment the model emits the first '.', instead of after
+        the whole reply (live test 2026-06-12: first audio ~350ms after
+        the sentence-final token, regardless of message granularity).
+        Words are never split across messages (Gradium inserts whitespace
+        BETWEEN messages); ``buf`` holds at most one partial word.
+        ``unsynthesized`` tracks text the server is holding without a
+        sentence boundary — a long punctuation-free stretch is force-flushed
+        on idle (mirrors the old LONG_FLUSH_LEN behavior, server-side)."""
         buf = ""
+        unsynthesized = 0
         filler_spoken = False
+        first_text_sent = False
+        first_send_t: Optional[float] = None
+        punct_ever = False
+        first_flush_done = False
+
+        def _mark_first_send(kind_: str, text: str) -> None:
+            nonlocal first_text_sent, first_send_t
+            if not first_text_sent:
+                first_text_sent = True
+                first_send_t = time.monotonic()
+                self._mark("first-text-to-tts",
+                           kind=kind_, chars=len(text))
+
+        async def _send(fragment: str, kind_: str) -> None:
+            nonlocal unsynthesized, punct_ever
+            if not fragment:
+                return
+            _mark_first_send(kind_, fragment)
+            await self._tts.send_text(fragment)
+            m = None
+            for m in _PUNCT_RE.finditer(fragment):
+                pass
+            if m is not None:
+                punct_ever = True
+                unsynthesized = len(fragment) - m.end()
+            else:
+                unsynthesized += len(fragment)
+
+        async def _maybe_first_flush() -> None:
+            # First-audio guard: if the model's first sentence is dragging
+            # on with no sentence-final punctuation, force one <flush> so
+            # the user hears SOMETHING (~350ms later) instead of dead air.
+            nonlocal first_flush_done, unsynthesized
+            if (first_send_t is not None and not punct_ever
+                    and not first_flush_done and unsynthesized > 0
+                    and time.monotonic() - first_send_t
+                    > FIRST_SENTENCE_FLUSH_S):
+                first_flush_done = True
+                self._mark("first-sentence-forced-flush",
+                           held_chars=unsynthesized)
+                await self._tts.send_text("<flush>")
+                unsynthesized = 0
+
         while True:
             try:
-                kind, payload = await asyncio.wait_for(q.get(), timeout=0.5)
+                kind, payload = await asyncio.wait_for(q.get(), timeout=0.2)
             except asyncio.TimeoutError:
-                if len(buf) > LONG_FLUSH_LEN:           # tts_tool.py:2604-2607
-                    await self._tts.send_text(buf)
+                await _maybe_first_flush()
+                if buf and len(buf) + unsynthesized > LONG_FLUSH_LEN:
+                    await _send(buf, "long-flush")
                     buf = ""
+                if unsynthesized > LONG_FLUSH_LEN:
+                    await self._tts.send_text("<flush>")
+                    unsynthesized = 0
                 continue
             if kind == "tool":
                 if not filler_spoken:
                     filler_spoken = True
+                    _mark_first_send("filler", self._filler)
                     await self._tts.send_filler(self._filler)
             elif kind == "delta":
                 buf += payload
-                while True:                              # tts_tool.py:2630-2641
-                    m = _SENTENCE_BOUNDARY_RE.search(buf)
-                    if m is None:
-                        break
-                    sentence, buf = buf[:m.end()], buf[m.end():]
-                    # Merge short fragments into the next sentence
-                    # (tts_tool.py:2637-2640).
-                    if len(sentence.strip()) < MIN_SENTENCE_LEN:
-                        buf = sentence + buf
-                        break
-                    await self._tts.send_text(sentence)
+                # Send everything up to the last whitespace (complete
+                # words); keep the trailing partial word.
+                cut = max(buf.rfind(" "), buf.rfind("\n"), buf.rfind("\t"))
+                if cut >= 0:
+                    await _send(buf[:cut + 1], "words")
+                    buf = buf[cut + 1:]
+                await _maybe_first_flush()
             elif kind == "done":
                 if buf.strip():
-                    await self._tts.send_text(buf)
+                    await _send(buf, "done-tail")
                 return
 
     # -- barge-in -----------------------------------------------------------
 
     async def _barge_in(self) -> None:
+        t0 = time.monotonic()
         # Latch first: if the executor thread is still constructing the
         # agent, _run picks this up right after construction and interrupts
         # before the first iteration (the direct path below would miss it).
@@ -382,8 +712,14 @@ class VoiceTurnLoop:
                 pass
         tts = self._tts
         if tts is not None:
-            await tts.abort()
+            # Mute synchronously FIRST: no further TTS audio may reach the
+            # transport while abort()'s socket close is in flight.
+            tts.mute()
         self._transport.clear_output()
+        logger.info("voice/timing barge-in audio-cleared in %.0fms",
+                    (time.monotonic() - t0) * 1000.0)
+        if tts is not None:
+            await tts.abort()
         if self._turn_task is not None and not self._turn_task.done():
             self._turn_task.cancel()
             try:
@@ -392,4 +728,5 @@ class VoiceTurnLoop:
                 pass
         self._turn_task = None
         self._state = LISTENING
-        logger.info("voice/turn: barge-in handled")
+        logger.info("voice/turn: barge-in handled in %.0fms",
+                    (time.monotonic() - t0) * 1000.0)

@@ -180,7 +180,19 @@ class VoiceAdapter(BasePlatformAdapter):
             api_key = os.environ["GRADIUM_API_KEY"]
             stt = gradium_stt.GradiumSTT(api_key)
             await stt.start()
-            transport = daily_transport.DailyTransport(loop, stt.send_audio)
+
+            # Inbound audio fans out to STT and to the turn loop's local
+            # energy barge-in (vloop exists only after the transport, so
+            # route through a late-bound cell).
+            vloop_cell: Dict[str, Any] = {}
+
+            async def on_audio_in(pcm: bytes) -> None:
+                vl = vloop_cell.get("vloop")
+                if vl is not None:
+                    await vl.on_inbound_audio(pcm)
+                await stt.send_audio(pcm)
+
+            transport = daily_transport.DailyTransport(loop, on_audio_in)
             await transport.join(room_url, token)
 
             async def tts_factory(on_audio):
@@ -190,6 +202,7 @@ class VoiceAdapter(BasePlatformAdapter):
 
             vloop = turn_loop.VoiceTurnLoop(
                 stt, tts_factory, transport, extra=self.config.extra or {})
+            vloop_cell["vloop"] = vloop
             task = asyncio.create_task(vloop.run())
             self._active_call = {
                 "stt": stt, "transport": transport, "loop": vloop, "task": task}

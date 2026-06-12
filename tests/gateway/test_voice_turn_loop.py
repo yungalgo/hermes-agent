@@ -68,6 +68,15 @@ class FakeSTT:
             {"horizon_s": 3.0, "inactivity_prob": prob},
         ]})
 
+    def push_speech_step(self, prob=0.05):
+        """Step whose short-horizon inactivity says the user is speaking."""
+        self.push({"type": "step", "total_duration_s": 1.0, "vad": [
+            {"horizon_s": 0.5, "inactivity_prob": prob},
+            {"horizon_s": 1.0, "inactivity_prob": prob},
+            {"horizon_s": 2.0, "inactivity_prob": prob},
+            {"horizon_s": 3.0, "inactivity_prob": prob},
+        ]})
+
 
 class FakeTTS:
     """Mirrors the GradiumTTSTurn surface the loop touches."""
@@ -88,6 +97,9 @@ class FakeTTS:
 
     async def end(self):
         self.ended = True
+
+    def mute(self):
+        self.aborted = True
 
     async def abort(self):
         self.aborted = True
@@ -305,7 +317,7 @@ async def test_flush_none_skips_flushed_wait(monkeypatch):
         stt.push_text("Do the thing please")
         start = time.monotonic()
         stt.push_end_of_turn_step()
-        await _eventually(lambda: len(agents) == 2)
+        await _eventually(lambda: len(agents) == 2 and agents[1].run_kwargs)
         # Well under FLUSHED_WAIT_TIMEOUT_S (2.0s): the wait was skipped.
         assert time.monotonic() - start < 1.0
         assert agents[1].run_kwargs["user_message"] == "Do the thing please"
@@ -315,11 +327,15 @@ async def test_flush_none_skips_flushed_wait(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_short_fragments_merged_into_next_sentence(monkeypatch):
+async def test_words_streamed_without_splitting(monkeypatch):
+    """Deltas are forwarded at word granularity: never split a word across
+    messages (Gradium inserts whitespace BETWEEN messages), and the text
+    reaches TTS without waiting for the full reply."""
     def behavior(agent):
-        # "Yes. " alone is < 20 chars — must be merged forward, not spoken.
+        # Token-ish deltas that split words across calls.
         agent.delta_cb("Yes. ")
-        agent.delta_cb("I can absolutely help with that request.")
+        agent.delta_cb("I can abso")
+        agent.delta_cb("lutely help with that request.")
         return {"final_response": "x"}
 
     install_agents(monkeypatch, [behavior])
@@ -329,17 +345,20 @@ async def test_short_fragments_merged_into_next_sentence(monkeypatch):
     try:
         await _eventually(lambda: factory.instances and factory.instances[0].ended)
         sent = factory.instances[0].sent
-        # The short fragment was never spoken alone (tts_tool.py:2637-2640
-        # mirror): it rides along with the rest at the final flush.
-        assert sent == ["Yes. I can absolutely help with that request."]
-        assert all(len(s.strip()) >= turn_loop.MIN_SENTENCE_LEN for s in sent)
+        # Whole reply delivered, no word ever split mid-message.
+        assert "".join(sent) == "Yes. I can absolutely help with that request."
+        # every fragment ends at a word boundary or the reply tail
+        for frag in sent:
+            assert frag.endswith((" ", ".")), frag
+        # "abso" was never sent alone — it rode with its completion.
+        assert all("abso" not in f or "absolutely" in f for f in sent)
     finally:
         await vloop.stop()
         await task
 
 
 @pytest.mark.asyncio
-async def test_long_buffer_flushes_without_boundary(monkeypatch):
+async def test_long_unpunctuated_text_gets_forced_flush(monkeypatch):
     blocker = threading.Event()
     no_boundary = "word " * 30  # 150 chars, no sentence punctuation
 
@@ -353,11 +372,15 @@ async def test_long_buffer_flushes_without_boundary(monkeypatch):
     vloop = _make_loop(stt, factory, transport)
     task = asyncio.create_task(vloop.run())
     try:
-        # The 0.5s queue-timeout path must flush the >100-char buffer even
-        # though no boundary ever arrives (tts_tool.py:2604-2607 mirror).
+        # Words are streamed immediately; with >100 chars unsynthesized and
+        # no sentence punctuation, the idle path forces a server-side
+        # <flush> so the audio is not held forever.
         await _eventually(lambda: factory.instances
-                          and factory.instances[0].sent == [no_boundary],
+                          and "<flush>" in factory.instances[0].sent,
                           timeout=5.0)
+        sent = factory.instances[0].sent
+        flush_idx = sent.index("<flush>")
+        assert "".join(sent[:flush_idx]) == no_boundary
     finally:
         blocker.set()
         await vloop.stop()
@@ -414,6 +437,306 @@ async def test_barge_in_interrupts_agent_aborts_tts_clears_output(monkeypatch):
         assert vloop._history == []
         # the barged-in utterance is kept for the next turn
         assert vloop._pending_text == ["stop right there"]
+    finally:
+        await vloop.stop()
+        await task
+
+
+@pytest.mark.asyncio
+async def test_eager_start_begins_turn_before_flush_ack(monkeypatch):
+    """The turn starts with the text already transcribed at vad-end; the
+    flush ack (370ms live) is awaited in parallel, not serialized."""
+    agents = install_agents(monkeypatch, [
+        say(GREETING_REPLY), say("Quick answer, with no flush-wait delay.")])
+    stt = FakeSTT(auto_ack=False)        # the ack never arrives on its own
+    factory, transport = FakeTTSFactory(), FakeTransport()
+    vloop = _make_loop(stt, factory, transport)
+    task = asyncio.create_task(vloop.run())
+    try:
+        await _eventually(lambda: vloop._state == turn_loop.LISTENING
+                          and len(vloop._history) == 1)
+        stt.push_text("what time is it")
+        stt.push_end_of_turn_step()
+        # The turn is already running while finalize still awaits the ack.
+        await _eventually(lambda: len(agents) == 2 and agents[1].run_kwargs)
+        assert agents[1].run_kwargs["user_message"] == "what time is it"
+        assert vloop._finalize_task is not None
+        # Ack with NO extra text: the eager turn stands, no restart.
+        stt.push({"type": "flushed", "flush_id": 1})
+        await _eventually(lambda: vloop._finalize_task is None)
+        await _eventually(lambda: len(vloop._history) == 3)
+        assert len(agents) == 2
+    finally:
+        await vloop.stop()
+        await task
+
+
+@pytest.mark.asyncio
+async def test_eager_restart_when_flush_delivers_transcript_tail(monkeypatch):
+    """If the flush DOES surface a transcript tail, the eager turn (which
+    cannot have spoken yet) is interrupted and restarted with the full
+    utterance — the user's last words are never dropped."""
+    class TailSTT(FakeSTT):
+        async def flush(self):
+            self.flush_calls += 1
+            self.push_text("right now")          # the tail
+            self.queue.put_nowait(
+                {"type": "flushed", "flush_id": self.flush_calls})
+            return self.flush_calls
+
+    agents = install_agents(monkeypatch, [
+        say(GREETING_REPLY),
+        speak_then_block("An eager answer that gets restarted. "),
+        say("Full answer to the complete question."),
+    ])
+    stt = TailSTT()
+    factory, transport = FakeTTSFactory(), FakeTransport()
+    vloop = _make_loop(stt, factory, transport)
+    task = asyncio.create_task(vloop.run())
+    try:
+        await _eventually(lambda: vloop._state == turn_loop.LISTENING
+                          and len(vloop._history) == 1)
+        stt.push_text("what time is it")
+        stt.push_end_of_turn_step()
+        await _eventually(lambda: len(agents) == 3 and agents[2].run_kwargs)
+        assert agents[1].interrupt_event.is_set()      # eager turn killed
+        assert agents[2].run_kwargs["user_message"] == \
+            "what time is it right now"
+        await _eventually(lambda: len(vloop._history) == 3)
+        assert vloop._history[1] == {
+            "role": "user", "content": "what time is it right now"}
+    finally:
+        await vloop.stop()
+        await task
+
+
+@pytest.mark.asyncio
+async def test_first_sentence_forced_flush_after_timeout(monkeypatch):
+    """A first sentence that drags on without punctuation gets ONE forced
+    <flush> so audio starts, instead of dead air."""
+    monkeypatch.setattr(turn_loop, "FIRST_SENTENCE_FLUSH_S", 0.05)
+    blocker = threading.Event()
+
+    def behavior(agent):
+        agent.delta_cb("a slow opening clause that just keeps going ")
+        blocker.wait(5.0)
+        agent.delta_cb("and finally ends.")
+        return {"final_response": "x"}
+
+    install_agents(monkeypatch, [behavior])
+    stt, factory, transport = FakeSTT(), FakeTTSFactory(), FakeTransport()
+    vloop = _make_loop(stt, factory, transport)
+    task = asyncio.create_task(vloop.run())
+    try:
+        await _eventually(lambda: factory.instances
+                          and "<flush>" in factory.instances[0].sent,
+                          timeout=5.0)
+        blocker.set()
+        await _eventually(lambda: factory.instances[0].ended)
+        # exactly one forced flush
+        assert factory.instances[0].sent.count("<flush>") == 1
+    finally:
+        blocker.set()
+        await vloop.stop()
+        await task
+
+
+@pytest.mark.asyncio
+async def test_barge_in_on_vad_speech_steps(monkeypatch):
+    """Speech-positive VAD steps during SPEAKING trigger a fast barge-in
+    WITHOUT waiting for finalized text (which can lag seconds during
+    overlapping speech). One step alone must NOT trigger (echo/blip guard)."""
+    agents = install_agents(monkeypatch, [
+        speak_then_block("A long answer that will be talked over shortly. ")])
+    stt, factory, transport = FakeSTT(), FakeTTSFactory(), FakeTransport()
+    vloop = _make_loop(stt, factory, transport)
+    task = asyncio.create_task(vloop.run())
+    try:
+        await _eventually(lambda: vloop._state == turn_loop.SPEAKING
+                          and factory.instances
+                          and factory.instances[0].sent)
+        # A single speech-positive step is below the consecutive-step
+        # threshold: no barge-in yet.
+        stt.push_speech_step()
+        await asyncio.sleep(0.1)
+        assert vloop._state == turn_loop.SPEAKING
+        # The second consecutive step crosses BARGE_VAD_CONSEC_STEPS.
+        stt.push_speech_step()
+        await _eventually(lambda: vloop._state == turn_loop.LISTENING,
+                          msg="VAD-step barge-in never fired")
+        assert agents[0].interrupt_reason == "user barge-in (voice)"
+        assert factory.instances[0].aborted is True
+        assert transport.clear_calls >= 1
+    finally:
+        await vloop.stop()
+        await task
+
+
+LOUD_CHUNK = (b"\x00\x20" * 1920)      # ~8k RMS s16le — clearly speech
+QUIET_CHUNK = (b"\x10\x00" * 1920)     # ~16 RMS — room-noise floor
+
+
+@pytest.mark.asyncio
+async def test_energy_barge_in_on_sustained_inbound_audio(monkeypatch):
+    """Sustained inbound energy while SPEAKING barges in instantly — no
+    STT round-trip. Below ENERGY_BARGE_CHUNKS consecutive chunks: nothing."""
+    agents = install_agents(monkeypatch, [
+        speak_then_block("A reply about to be talked over loudly. ")])
+    stt, factory, transport = FakeSTT(), FakeTTSFactory(), FakeTransport()
+    vloop = _make_loop(stt, factory, transport)
+    task = asyncio.create_task(vloop.run())
+    try:
+        await _eventually(lambda: vloop._state == turn_loop.SPEAKING)
+        # one fewer than the threshold, then a quiet chunk: counter resets
+        for _ in range(turn_loop.ENERGY_BARGE_CHUNKS - 1):
+            await vloop.on_inbound_audio(LOUD_CHUNK)
+        await vloop.on_inbound_audio(QUIET_CHUNK)
+        assert vloop._state == turn_loop.SPEAKING
+        for _ in range(turn_loop.ENERGY_BARGE_CHUNKS):
+            await vloop.on_inbound_audio(LOUD_CHUNK)
+        await _eventually(lambda: vloop._state == turn_loop.LISTENING,
+                          msg="energy barge-in never fired")
+        assert agents[0].interrupt_event.is_set()
+        assert factory.instances[0].aborted is True
+        assert transport.clear_calls >= 1
+    finally:
+        await vloop.stop()
+        await task
+
+
+@pytest.mark.asyncio
+async def test_energy_ignored_while_listening(monkeypatch):
+    agents = install_agents(monkeypatch, [say(GREETING_REPLY)])
+    stt, factory, transport = FakeSTT(), FakeTTSFactory(), FakeTransport()
+    vloop = _make_loop(stt, factory, transport)
+    task = asyncio.create_task(vloop.run())
+    try:
+        await _eventually(lambda: vloop._state == turn_loop.LISTENING
+                          and len(vloop._history) == 1)
+        for _ in range(turn_loop.ENERGY_BARGE_CHUNKS * 2):
+            await vloop.on_inbound_audio(LOUD_CHUNK)
+        assert vloop._state == turn_loop.LISTENING
+        assert transport.clear_calls == 0
+        assert len(agents) == 1
+    finally:
+        await vloop.stop()
+        await task
+
+
+@pytest.mark.asyncio
+async def test_non_consecutive_speech_steps_do_not_barge_in(monkeypatch):
+    """A speech blip followed by a silence step resets the counter."""
+    agents = install_agents(monkeypatch, [
+        speak_then_block("Another long answer that keeps going for a bit. ")])
+    stt, factory, transport = FakeSTT(), FakeTTSFactory(), FakeTransport()
+    vloop = _make_loop(stt, factory, transport)
+    task = asyncio.create_task(vloop.run())
+    try:
+        await _eventually(lambda: vloop._state == turn_loop.SPEAKING)
+        stt.push_speech_step()
+        stt.push_end_of_turn_step()      # silence: resets the streak
+        stt.push_speech_step()
+        await asyncio.sleep(0.2)
+        assert vloop._state == turn_loop.SPEAKING
+        assert not agents[0].interrupt_event.is_set()
+    finally:
+        await vloop.stop()
+        await task
+
+
+@pytest.mark.asyncio
+async def test_finalize_fires_on_speech_seen_even_without_text_yet(monkeypatch):
+    """After VAD saw speech, end-of-turn must finalize even though no
+    finalized ``text`` has arrived yet — the flush forces the transcript
+    out, and the turn uses whatever text lands before the ack."""
+    class LateTextSTT(FakeSTT):
+        async def flush(self):
+            self.flush_calls += 1
+            # transcript only arrives WITH the flush (delayed text path)
+            self.push_text("late words from the flush")
+            self.queue.put_nowait(
+                {"type": "flushed", "flush_id": self.flush_calls})
+            return self.flush_calls
+
+    agents = install_agents(monkeypatch, [
+        say(GREETING_REPLY), say("Heard you loud and clear, late or not.")])
+    stt = LateTextSTT()
+    factory, transport = FakeTTSFactory(), FakeTransport()
+    vloop = _make_loop(stt, factory, transport)
+    task = asyncio.create_task(vloop.run())
+    try:
+        await _eventually(lambda: vloop._state == turn_loop.LISTENING
+                          and len(vloop._history) == 1)
+        # VAD sees speech (2 consecutive steps), then end-of-turn silence —
+        # but NO text event has arrived yet.
+        stt.push_speech_step()
+        stt.push_speech_step()
+        stt.push_end_of_turn_step()
+        await _eventually(lambda: len(agents) == 2 and agents[1].run_kwargs)
+        assert agents[1].run_kwargs["user_message"] == "late words from the flush"
+    finally:
+        await vloop.stop()
+        await task
+
+
+@pytest.mark.asyncio
+async def test_pre_audio_barge_in_requeues_user_utterance(monkeypatch):
+    """Barging in BEFORE any reply audio was produced must not lose the
+    user's words: they are re-queued and merged into the next turn."""
+    blocker_reply = "A reply the user never gets to hear at all. "
+    agents = install_agents(monkeypatch, [
+        say(GREETING_REPLY),
+        speak_then_block(blocker_reply),
+        say("Combined answer to both parts of the question."),
+    ])
+    stt, factory, transport = FakeSTT(), FakeTTSFactory(), FakeTransport()
+    vloop = _make_loop(stt, factory, transport)
+    task = asyncio.create_task(vloop.run())
+    try:
+        await _eventually(lambda: vloop._state == turn_loop.LISTENING
+                          and len(vloop._history) == 1)
+        stt.push_text("first part of the question")
+        stt.push_end_of_turn_step()
+        await _eventually(lambda: vloop._state == turn_loop.SPEAKING)
+        # user resumes speaking before hearing anything (FakeTTS produces
+        # no audio chunks, so first_audio_seen is False)
+        stt.push_speech_step()
+        stt.push_speech_step()
+        await _eventually(lambda: vloop._state == turn_loop.LISTENING)
+        assert vloop._pending_text == ["first part of the question"]
+        stt.push_text("and the second part")
+        stt.push_end_of_turn_step()
+        await _eventually(lambda: len(agents) == 3 and agents[2].run_kwargs)
+        assert agents[2].run_kwargs["user_message"] == \
+            "first part of the question and the second part"
+    finally:
+        await vloop.stop()
+        await task
+
+
+@pytest.mark.asyncio
+async def test_canned_greeting_speaks_without_agent_and_prewarms(monkeypatch):
+    """extra.greeting_text speaks instantly through TTS (no LLM round-trip)
+    and pre-warms the first user turn's agent while the greeting plays."""
+    agents = install_agents(monkeypatch, [say("Quarter past three.")])
+    stt, factory, transport = FakeSTT(), FakeTTSFactory(), FakeTransport()
+    vloop = _make_loop(stt, factory, transport,
+                       extra={"greeting_text": "Hey! How can I help?"})
+    task = asyncio.create_task(vloop.run())
+    try:
+        await _eventually(lambda: factory.instances and factory.instances[0].ended)
+        assert factory.instances[0].sent == ["Hey! How can I help?"]
+        assert vloop._history == [
+            {"role": "assistant", "content": "Hey! How can I help?"}]
+        # the prewarmed agent exists but has not run
+        await _eventually(lambda: len(agents) == 1)
+        assert agents[0].run_kwargs is None
+        # first user turn consumes the prewarmed agent — no new construction
+        stt.push_text("what time is it")
+        stt.push_end_of_turn_step()
+        await _eventually(lambda: agents[0].run_kwargs is not None)
+        assert agents[0].run_kwargs["user_message"] == "what time is it"
+        assert len(agents) == 1
     finally:
         await vloop.stop()
         await task
@@ -486,8 +809,10 @@ async def test_stop_cancels_inflight_turn(monkeypatch):
 async def test_stale_pre_rotation_ack_does_not_satisfy_new_flush_wait(monkeypatch):
     """A ``flushed`` ack carrying an OLD flush id (e.g. replayed by the
     pre-rotation socket — both sessions share one events queue) must not
-    satisfy a wait keyed on a NEWER id: the loop waits out the timeout
-    instead of being falsely released."""
+    satisfy a wait keyed on a NEWER id. With eager start the turn itself
+    no longer waits on the ack, but a falsely-released wait would let a
+    stale transcript tail trigger a bogus eager-restart later — the
+    ``_flushed`` event must stay unset."""
     monkeypatch.setattr(turn_loop, "FLUSHED_WAIT_TIMEOUT_S", 0.3)
 
     class StaleAckSTT(FakeSTT):
@@ -512,18 +837,18 @@ async def test_stale_pre_rotation_ack_does_not_satisfy_new_flush_wait(monkeypatc
                           and len(vloop._history) == 1)
         stt.push_text("first question for you")
         stt.push_end_of_turn_step()
-        await _eventually(lambda: len(agents) == 2 and len(vloop._history) == 3)
+        await _eventually(lambda: len(vloop._history) == 3)
         # Second user turn: flush id 2, but only the stale ack (id 1) arrives.
         stt.push_text("second question for you")
-        start = time.monotonic()
         stt.push_end_of_turn_step()
-        await _eventually(lambda: len(agents) == 3 and agents[2].run_kwargs)
-        elapsed = time.monotonic() - start
-        # The stale ack did NOT release the wait: the full (reduced)
-        # flush timeout was burned before proceeding.
-        assert elapsed >= 0.3
+        await _eventually(lambda: len(agents) >= 3 and agents[2].run_kwargs)
         assert agents[2].run_kwargs["user_message"] == "second question for you"
+        # The stale ack never released the wait keyed on flush id 2, and
+        # the finalize completed (timed out) without a bogus restart.
+        await _eventually(lambda: vloop._finalize_task is None)
         assert not vloop._flushed.is_set()
+        await _eventually(lambda: len(vloop._history) == 5)
+        assert len(agents) == 3          # one agent per turn — no restarts
     finally:
         await vloop.stop()
         await task
@@ -619,8 +944,12 @@ async def test_interrupted_turn_await_is_bounded(monkeypatch, caplog):
 @pytest.mark.asyncio
 async def test_stop_cancels_pending_finalize_before_barge_in(monkeypatch):
     """stop() must cancel a pending finalize BEFORE barge-in: otherwise the
-    finalize can _start_turn in the window and orphan a fresh turn."""
-    agents = install_agents(monkeypatch, [say(GREETING_REPLY)])
+    finalize (still awaiting the flush ack) could eager-RESTART a turn in
+    that window and orphan it past teardown."""
+    agents = install_agents(monkeypatch, [
+        say(GREETING_REPLY),
+        speak_then_block("An eager answer that stop() will cut short. "),
+    ])
     stt = FakeSTT(auto_ack=False)    # finalize blocks awaiting the flush ack
     factory, transport = FakeTTSFactory(), FakeTransport()
     vloop = _make_loop(stt, factory, transport)
@@ -629,8 +958,12 @@ async def test_stop_cancels_pending_finalize_before_barge_in(monkeypatch):
                       and len(vloop._history) == 1)
     stt.push_text("one last thing before you go")
     stt.push_end_of_turn_step()
-    await _eventually(lambda: vloop._finalize_task is not None,
-                      msg="finalize never became pending")
+    # Eager start: the turn begins immediately; finalize stays pending on
+    # the (never-arriving) flush ack.
+    await _eventually(lambda: vloop._finalize_task is not None
+                      and len(agents) == 2,
+                      msg="finalize/eager turn never became pending")
+    assert vloop._finalize_task is not None and not vloop._finalize_task.done()
     # Spy: by the time stop() reaches _barge_in, finalize must be gone.
     orig_barge_in = vloop._barge_in
     finalize_gone_at_barge_in = []
@@ -644,7 +977,8 @@ async def test_stop_cancels_pending_finalize_before_barge_in(monkeypatch):
     await vloop.stop()
     await asyncio.wait_for(task, timeout=5.0)
     assert finalize_gone_at_barge_in == [True]
-    # The pending finalize never spawned a fresh (orphaned) turn.
-    assert len(agents) == 1
-    assert len(factory.instances) == 1
+    # The eager turn was killed, no restart was spawned past teardown.
+    assert agents[1].interrupt_event.is_set()
+    assert vloop._turn_task is None
+    assert len(agents) == 2
     assert vloop._history == [{"role": "assistant", "content": GREETING_REPLY}]
