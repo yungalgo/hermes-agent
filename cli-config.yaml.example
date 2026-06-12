@@ -728,8 +728,19 @@ platform_toolsets:
 #       mode: standalone            # standalone | orchestrated
 #       voice_id: ""                # Gradium TTS voice id (or VOICE_GRADIUM_VOICE_ID)
 #       greeting_prompt: ""         # override the agent's first-utterance prompt
+#       greeting_text: ""           # canned greeting spoken instantly (skips the LLM greeting turn)
 #       filler_text: "One moment."  # spoken when a tool call starts
 #       max_turns: 90               # per-utterance agent tool-loop cap (default HERMES_MAX_ITERATIONS or 90)
+#       model: ""                   # voice-turn model override (empty = gateway model)
+#       barge_energy_chunks: 2      # consecutive hot 80ms chunks to barge in (1 = experimental fast trigger)
+#       # Vamp: pre-synthesized acknowledgment clips ("Mm — let me think.")
+#       # played on a fast end-of-turn signal so the caller hears audio
+#       # quickly while the substantive reply streams in behind it.
+#       vamp_enabled: true
+#       vamp_trigger: energy        # energy | vad | off
+#       vamp_texts: []              # override the default acknowledgment texts
+#       vamp_energy_silence_chunks: 3   # quiet 80ms chunks after speech before the vamp fires
+#       vamp_energy_min_speech_chunks: 2  # hot chunks required before quiet counts
 #
 # Discord-specific settings (config.yaml top-level, not under platforms:):
 #

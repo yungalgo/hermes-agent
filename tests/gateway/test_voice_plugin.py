@@ -134,12 +134,29 @@ class FakeTTSTurn:
         self.sent.append(text)
 
 
+class FakeVampCache:
+    def __init__(self, api_key, voice_id, texts=None):
+        self.api_key = api_key
+        self.voice_id = voice_id
+        self.texts = texts
+        self.started = False
+        self.stopped = False
+        self.ready = False
+
+    def start(self):
+        self.started = True
+
+    async def stop(self):
+        self.stopped = True
+
+
 class FakeVoiceTurnLoop:
-    def __init__(self, stt, tts_factory, transport, *, extra):
+    def __init__(self, stt, tts_factory, transport, *, extra, vamp=None):
         self.stt = stt
         self.tts_factory = tts_factory
         self.transport = transport
         self.extra = extra
+        self.vamp = vamp
         self.stopped = False
         self._tts = None
         self._stop_event = asyncio.Event()
@@ -157,7 +174,7 @@ class FakeVoiceTurnLoop:
 
 
 class FakeModules:
-    """Stands in for the five sibling modules returned by _voice_modules."""
+    """Stands in for the six sibling modules returned by _voice_modules."""
 
     def __init__(self):
         self.control_channels = []
@@ -165,6 +182,7 @@ class FakeModules:
         self.transports = []
         self.tts_turns = []
         self.turn_loops = []
+        self.vamps = []
 
         outer = self
 
@@ -193,12 +211,18 @@ class FakeModules:
                 super().__init__(*a, **kw)
                 outer.turn_loops.append(self)
 
+        class _Vamp(FakeVampCache):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, **kw)
+                outer.vamps.append(self)
+
         self.modules = (
             SimpleNamespace(ControlChannel=_ControlChannel),
             SimpleNamespace(DailyTransport=_Transport),
             SimpleNamespace(GradiumSTT=_STT),
             SimpleNamespace(GradiumTTSTurn=_TTSTurn),
             SimpleNamespace(VoiceTurnLoop=_TurnLoop),
+            SimpleNamespace(VampCache=_Vamp),
         )
 
 
@@ -405,3 +429,44 @@ async def test_create_standalone_room_daily_rest_shapes(monkeypatch):
     assert posts[1]["url"] == "https://api.daily.co/v1/meeting-tokens"
     assert posts[1]["json"]["properties"]["room_name"] == "r9"
     assert posts[1]["json"]["properties"]["is_owner"] is False
+
+
+# ---------------------------------------------------------------------------
+# Vamp lifecycle (adapter-level)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_call_start_creates_and_starts_vamp_cache(
+        fake_modules, monkeypatch):
+    adapter = _orchestrated_adapter(
+        monkeypatch, extra={"voice_id": "vox-2",
+                            "vamp_texts": ["Right.", "One sec."]})
+    await adapter.connect()
+    await fake_modules.control_channels[0].on_event(
+        {"action": "join_room", "roomUrl": "https://x.daily.co/r1",
+         "token": "t1"})
+    assert len(fake_modules.vamps) == 1
+    vamp = fake_modules.vamps[0]
+    # background synthesis kicked off, in the agent's voice, custom texts
+    assert vamp.started is True
+    assert vamp.api_key == "g-test"
+    assert vamp.voice_id == "vox-2"
+    assert vamp.texts == ["Right.", "One sec."]
+    # the cache is handed to the turn loop
+    assert fake_modules.turn_loops[0].vamp is vamp
+    await adapter.disconnect()
+    assert vamp.stopped is True
+
+
+@pytest.mark.asyncio
+async def test_vamp_disabled_by_config(fake_modules, monkeypatch):
+    adapter = _orchestrated_adapter(monkeypatch,
+                                    extra={"vamp_enabled": False})
+    await adapter.connect()
+    await fake_modules.control_channels[0].on_event(
+        {"action": "join_room", "roomUrl": "https://x.daily.co/r1",
+         "token": "t1"})
+    assert fake_modules.vamps == []
+    assert fake_modules.turn_loops[0].vamp is None
+    await adapter.disconnect()

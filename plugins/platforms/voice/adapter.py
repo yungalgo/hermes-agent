@@ -39,6 +39,7 @@ def _voice_modules():
         import gradium_stt
         import gradium_tts
         import turn_loop
+        import vamp
     except ImportError:
         from . import (
             control_channel,
@@ -46,8 +47,10 @@ def _voice_modules():
             gradium_stt,
             gradium_tts,
             turn_loop,
+            vamp,
         )
-    return control_channel, daily_transport, gradium_stt, gradium_tts, turn_loop
+    return (control_channel, daily_transport, gradium_stt, gradium_tts,
+            turn_loop, vamp)
 
 
 def _daily_available() -> bool:
@@ -172,12 +175,23 @@ class VoiceAdapter(BasePlatformAdapter):
             await self._end_call()
 
     async def _start_call(self, room_url: str, token: str) -> None:
-        _, daily_transport, gradium_stt, gradium_tts, turn_loop = _voice_modules()
+        (_, daily_transport, gradium_stt, gradium_tts, turn_loop,
+         vamp_mod) = _voice_modules()
         async with self._call_lock:
             if self._active_call is not None:
                 await self._end_call_locked()
             loop = asyncio.get_running_loop()
             api_key = os.environ["GRADIUM_API_KEY"]
+            extra = self.config.extra or {}
+            # Vamp clips synthesize in the BACKGROUND (start() returns
+            # immediately) — clip generation must never delay the join;
+            # the vamp stays disabled until clips are ready (notes §16).
+            vamp_cache = None
+            if extra.get("vamp_enabled", True):
+                vamp_cache = vamp_mod.VampCache(
+                    api_key, self._voice_id,
+                    texts=extra.get("vamp_texts"))
+                vamp_cache.start()
             stt = gradium_stt.GradiumSTT(api_key)
             await stt.start()
 
@@ -201,11 +215,12 @@ class VoiceAdapter(BasePlatformAdapter):
                 return turn
 
             vloop = turn_loop.VoiceTurnLoop(
-                stt, tts_factory, transport, extra=self.config.extra or {})
+                stt, tts_factory, transport, extra=extra, vamp=vamp_cache)
             vloop_cell["vloop"] = vloop
             task = asyncio.create_task(vloop.run())
             self._active_call = {
-                "stt": stt, "transport": transport, "loop": vloop, "task": task}
+                "stt": stt, "transport": transport, "loop": vloop,
+                "task": task, "vamp": vamp_cache}
             logger.info("voice: call started in %s", room_url)
 
     async def _end_call(self) -> None:
@@ -217,6 +232,9 @@ class VoiceAdapter(BasePlatformAdapter):
         if call is None:
             return
         self._active_call = None
+        vamp_cache = call.get("vamp")
+        if vamp_cache is not None:
+            await vamp_cache.stop()
         await call["loop"].stop()
         call["task"].cancel()
         try:

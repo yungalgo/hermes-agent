@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import json
 import logging
 import os
 import re
@@ -67,7 +68,31 @@ ENERGY_BARGE_RMS = 500
 # Two 80ms chunks: a bare "Wait—" is exactly 2 hot chunks before its
 # inter-word dip (measured on the synthetic barge utterance); 4 chunks
 # missed it entirely and lost the race to the ~700ms server-side VAD.
+# Overridable via extra.barge_energy_chunks (1 = the experimental 80ms
+# single-chunk trigger; keep default 2 — one chunk is blip/echo-prone).
 ENERGY_BARGE_CHUNKS = 2
+# Vamp (perceived-latency acknowledgment clips, notes §16): fired on a
+# FAST end-of-turn signal, before the (slow, ~550ms) vad-end confirmation.
+# Two trigger designs, selectable via extra.vamp_trigger:
+#   energy: N consecutive quiet 80ms inbound chunks after >=M hot chunks
+#           (the inverse of the energy barge-in trigger). Available
+#           instantly; fires N*80ms after the user stops.
+#   vad:    first short-horizon VAD crossing (0.5s inactivity_prob rising
+#           through VAMP_VAD_PROB) — semantically smarter, but rides the
+#           STT round-trip.
+VAMP_TRIGGERS = ("energy", "vad", "off")
+DEFAULT_VAMP_TRIGGER = "energy"
+VAMP_ENERGY_SILENCE_CHUNKS = 3      # 240ms of quiet after speech
+VAMP_ENERGY_MIN_SPEECH_CHUNKS = 2   # >=160ms of speech before quiet counts
+VAMP_VAD_HORIZON = 0.5
+VAMP_VAD_PROB = 0.7
+# False-fire recovery: the user resuming speech while the vamp clip is
+# still playing means the vamp fired mid-utterance — drop the remaining
+# clip audio after this many hot chunks (2 = echo/blip guard, same
+# reasoning as the barge-in trigger).
+VAMP_CANCEL_HOT_CHUNKS = 2
+# Cancel window slack past the clip's nominal duration (transit + jitter).
+VAMP_PLAYOUT_SLACK_S = 0.3
 FLUSHED_WAIT_TIMEOUT_S = 2.0
 # If the first sentence hasn't reached a sentence-final punctuation this
 # long after its first words went to TTS, force a <flush> once so audio
@@ -95,6 +120,44 @@ def _rms(pcm: bytes) -> float:
     if len(samples) == 0:
         return 0.0
     return (sum(s * s for s in samples) / len(samples)) ** 0.5
+
+
+def _resolve_turn_model(extra: Dict[str, Any]) -> Optional[str]:
+    """platforms.voice.extra.model overrides the gateway default model for
+    voice turns only (latency: a faster model for spoken replies without
+    touching the agent's main model). None = use the gateway model."""
+    raw = (extra or {}).get("model")
+    if raw is None:
+        return None
+    model = str(raw).strip()
+    return model or None
+
+
+def _resolve_int_extra(extra: Dict[str, Any], key: str, default: int) -> int:
+    raw = (extra or {}).get(key)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("voice/turn: invalid %s %r ignored", key, raw)
+        return default
+    if value < 1:
+        logger.warning("voice/turn: %s must be >= 1; %r ignored", key, raw)
+        return default
+    return value
+
+
+def _resolve_vamp_trigger(extra: Dict[str, Any]) -> str:
+    raw = (extra or {}).get("vamp_trigger")
+    if raw is None:
+        return DEFAULT_VAMP_TRIGGER
+    trigger = str(raw).strip().lower()
+    if trigger not in VAMP_TRIGGERS:
+        logger.warning("voice/turn: invalid vamp_trigger %r ignored "
+                       "(valid: %s)", raw, "|".join(VAMP_TRIGGERS))
+        return DEFAULT_VAMP_TRIGGER
+    return trigger
 
 
 def _resolve_max_iterations(extra: Dict[str, Any]) -> int:
@@ -130,7 +193,7 @@ def _create_voice_agent(
     runtime_kwargs = _resolve_runtime_agent_kwargs()
     user_config = _load_gateway_config()
     return AIAgent(
-        model=_resolve_gateway_model(),
+        model=_resolve_turn_model(extra or {}) or _resolve_gateway_model(user_config),
         **runtime_kwargs,
         max_iterations=_resolve_max_iterations(extra or {}),
         quiet_mode=True,
@@ -146,8 +209,11 @@ def _create_voice_agent(
 
 
 class VoiceTurnLoop:
-    def __init__(self, stt, tts_factory, transport, *, extra: Dict[str, Any]):
-        """tts_factory(on_audio) -> opened GradiumTTSTurn (one per turn)."""
+    def __init__(self, stt, tts_factory, transport, *, extra: Dict[str, Any],
+                 vamp=None):
+        """tts_factory(on_audio) -> opened GradiumTTSTurn (one per turn).
+        vamp: optional VampCache (vamp.py) — pre-synthesized acknowledgment
+        clips fired on the fast end-of-turn trigger."""
         self._stt = stt
         self._tts_factory = tts_factory
         self._transport = transport
@@ -158,6 +224,31 @@ class VoiceTurnLoop:
         self._history: List[Dict[str, str]] = []
         self._pending_text: List[str] = []
         self._state = LISTENING
+        # Vamp state. _vamp_armed gates ONE vamp per turn cycle (re-armed
+        # when a turn completes); _vamp_playing_until bounds the false-fire
+        # cancel window; the _utt counters implement the energy
+        # silence-onset trigger (inverse of the barge-in energy trigger).
+        self._vamp = vamp
+        self._vamp_trigger = _resolve_vamp_trigger(self._extra)
+        self._vamp_silence_chunks = _resolve_int_extra(
+            self._extra, "vamp_energy_silence_chunks",
+            VAMP_ENERGY_SILENCE_CHUNKS)
+        self._vamp_min_speech = _resolve_int_extra(
+            self._extra, "vamp_energy_min_speech_chunks",
+            VAMP_ENERGY_MIN_SPEECH_CHUNKS)
+        self._vamp_armed = True
+        self._vamp_playing_until = 0.0
+        self._vamp_resume_hot = 0
+        self._utt_hot_chunks = 0
+        self._utt_quiet_chunks = 0
+        self._last_hot_t: Optional[float] = None
+        self._energy_barge_chunks = _resolve_int_extra(
+            self._extra, "barge_energy_chunks", ENERGY_BARGE_CHUNKS)
+        # Telemetry (notes §16): one structured record per turn cycle,
+        # opened at the first cycle event (vamp fire or vad-end), emitted
+        # as a JSON log line when the turn ends; per-call summary on stop.
+        self._tel: Dict[str, Any] = {}
+        self._call_stats: List[Dict[str, Any]] = []
         # VAD speech tracking: consecutive speech-positive steps drive the
         # fast barge-in trigger; _speech_seen lets end-of-turn finalize even
         # before the (slow) finalized text has arrived — flush forces it out.
@@ -205,6 +296,137 @@ class VoiceTurnLoop:
         extra = "".join(f" {k}={v}" for k, v in fields.items())
         logger.info("voice/timing turn=%d %s t=+%.0fms%s",
                     self._turn_seq, leg, (now - ref) * 1000.0, extra)
+
+    # -- telemetry (notes §16) ------------------------------------------------
+
+    def _tel_open(self) -> None:
+        if not self._tel:
+            self._tel = {"opened_at": time.monotonic()}
+            if self._last_hot_t is not None:
+                self._tel["speech_end"] = self._last_hot_t
+            reset = getattr(self._transport, "reset_write_mark", None)
+            if reset is not None:
+                reset()
+
+    def _tel_set(self, key: str, value: Any = None) -> None:
+        """Record a telemetry timestamp (default: now) or value. First
+        write wins — retries/restarts must not overwrite the first leg."""
+        self._tel_open()
+        self._tel.setdefault(key, time.monotonic() if value is None else value)
+
+    def _tel_emit(self, status: str) -> None:
+        """Emit the per-turn structured JSON log line and bank the record
+        for the per-call summary. All offsets are ms since speech_end (the
+        last energy-hot inbound chunk — the closest proxy for the end of
+        the user's utterance; vad_end lags it by ~550ms live)."""
+        tel, self._tel = self._tel, {}
+        if not tel:
+            return
+        speech_end = tel.get("speech_end") or tel.get("vad_end") \
+            or tel.get("opened_at")
+        first_written = getattr(self._transport, "first_write_t", None)
+
+        def off(t: Optional[float]) -> Optional[int]:
+            return None if t is None else int(round((t - speech_end) * 1000))
+
+        perceived = off(first_written)
+        substantive = off(tel.get("tts_first_audio"))
+        record = {
+            "event": "voice_turn",
+            "turn": self._turn_seq,
+            "status": status,
+            "vad_end_ms": off(tel.get("vad_end")),
+            "flush_result": tel.get("flush_result"),
+            "flush_done_ms": off(tel.get("flush_done")),
+            "agent_start_ms": off(tel.get("agent_start")),
+            "first_delta_ms": off(tel.get("first_delta")),
+            "first_sentence_ms": off(tel.get("first_sentence")),
+            "tts_first_audio_ms": substantive,
+            "first_frame_written_ms": perceived,
+            "vamp": {
+                "fired": "vamp_fired_at" in tel,
+                "fired_at_ms": off(tel.get("vamp_fired_at")),
+                "trigger": tel.get("vamp_trigger"),
+                "text": tel.get("vamp_text"),
+                "false_fire": bool(tel.get("vamp_false_fire")),
+            },
+            "totals": {
+                "perceived_first_audio_ms": perceived,
+                "substantive_first_audio_ms": substantive,
+                "turn_total_ms": off(time.monotonic()),
+            },
+        }
+        logger.info("voice/telemetry %s", json.dumps(record))
+        self._call_stats.append(record)
+
+    def _emit_call_summary(self) -> None:
+        turns = [r for r in self._call_stats if r["vad_end_ms"] is not None]
+
+        def stats(key: str) -> Optional[Dict[str, int]]:
+            vals = sorted(r["totals"][key] for r in turns
+                          if r["totals"][key] is not None)
+            if not vals:
+                return None
+            return {"median": vals[len(vals) // 2],
+                    "p90": vals[min(len(vals) - 1, int(len(vals) * 0.9))],
+                    "n": len(vals)}
+
+        record = {
+            "event": "voice_call_summary",
+            "session": self._session_id,
+            "turns": len(turns),
+            "vamp_fired": sum(1 for r in turns if r["vamp"]["fired"]),
+            "vamp_false_fires": sum(
+                1 for r in self._call_stats if r["vamp"]["false_fire"]),
+            "barge_ins": sum(1 for r in self._call_stats
+                             if r["status"] == "interrupted"),
+            "perceived_first_audio_ms": stats("perceived_first_audio_ms"),
+            "substantive_first_audio_ms": stats("substantive_first_audio_ms"),
+        }
+        logger.info("voice/telemetry %s", json.dumps(record))
+
+    # -- vamp -----------------------------------------------------------------
+
+    async def _fire_vamp(self, source: str) -> None:
+        """Write one pre-synthesized acknowledgment clip to the transport.
+        Skips (a missed vamp is fine — the pipeline covers) when: no cache,
+        clips not ready yet, already fired this cycle, trigger disabled, or
+        the substantive turn is already underway (state left LISTENING)."""
+        if (self._vamp is None or not self._vamp_armed
+                or self._vamp_trigger == "off"
+                or self._state != LISTENING):
+            return
+        if not self._vamp.ready:
+            self._mark("vamp-skip", reason="clips-not-ready", source=source)
+            return
+        picked = self._vamp.pick()
+        if picked is None:
+            return
+        text, pcm = picked
+        self._vamp_armed = False
+        self._vamp_resume_hot = 0
+        now = time.monotonic()
+        duration_s = len(pcm) / 2.0 / 48000.0
+        self._vamp_playing_until = now + duration_s + VAMP_PLAYOUT_SLACK_S
+        self._tel_set("vamp_fired_at", now)
+        self._tel_set("vamp_trigger", source)
+        self._tel_set("vamp_text", text)
+        self._mark("vamp-fired", source=source, dur_ms=int(duration_s * 1000),
+                   text=repr(text))
+        # 80ms chunks: barge-in's clear_output() drops unplayed audio at
+        # chunk granularity, and the substantive reply naturally queues
+        # behind the clip boundary.
+        for offset in range(0, len(pcm), 7680):
+            await self._transport.send_audio(pcm[offset:offset + 7680])
+
+    def _cancel_vamp(self) -> None:
+        """False fire: the user resumed speaking while the clip was still
+        playing — drop the remaining (unplayed) clip audio."""
+        self._vamp_playing_until = 0.0
+        self._vamp_resume_hot = 0
+        self._tel_set("vamp_false_fire", True)
+        self._transport.clear_output()
+        self._mark("vamp-false-fire-cancelled")
 
     # -- agent plumbing -----------------------------------------------------
 
@@ -274,6 +496,8 @@ class VoiceTurnLoop:
             except (asyncio.CancelledError, Exception):
                 pass
         await self._barge_in()           # kill any in-flight turn
+        self._tel_emit("call-ended")
+        self._emit_call_summary()
         self._stopped.set()
 
     async def _speak_canned(self, text: str) -> None:
@@ -300,21 +524,44 @@ class VoiceTurnLoop:
 
     async def on_inbound_audio(self, pcm: bytes) -> None:
         """Called by the adapter for every inbound 80ms caller chunk, in
-        parallel with STT. Sustained energy while the agent is
-        thinking/speaking barges in WITHOUT waiting for the STT round-trip
-        (0.6-1.8s measured live)."""
-        if self._state not in (THINKING, SPEAKING):
-            self._energy_hot_chunks = 0
-            return
-        if _rms(pcm) >= ENERGY_BARGE_RMS:
+        parallel with STT. Two energy-based fast paths live here:
+          THINKING/SPEAKING: sustained energy = the user talking over the
+            agent -> barge in WITHOUT waiting for the STT round-trip
+            (0.6-1.8s measured live).
+          LISTENING: quiet chunks after speech = silence onset -> fire the
+            vamp clip (the inverse trigger); hot chunks while a vamp clip
+            is still playing = false fire -> drop the remaining clip."""
+        hot = _rms(pcm) >= ENERGY_BARGE_RMS
+        if self._state in (THINKING, SPEAKING):
+            self._utt_hot_chunks = 0
+            self._utt_quiet_chunks = 0
+            if not hot:
+                self._energy_hot_chunks = 0
+                return
             self._energy_hot_chunks += 1
-        else:
-            self._energy_hot_chunks = 0
+            if self._energy_hot_chunks >= self._energy_barge_chunks:
+                self._energy_hot_chunks = 0
+                self._mark("barge-in-trigger", source="energy",
+                           state=self._state)
+                await self._barge_in()
             return
-        if self._energy_hot_chunks >= ENERGY_BARGE_CHUNKS:
-            self._energy_hot_chunks = 0
-            self._mark("barge-in-trigger", source="energy", state=self._state)
-            await self._barge_in()
+        self._energy_hot_chunks = 0
+        now = time.monotonic()
+        if hot:
+            self._last_hot_t = now
+            self._utt_hot_chunks += 1
+            self._utt_quiet_chunks = 0
+            if now < self._vamp_playing_until:
+                self._vamp_resume_hot += 1
+                if self._vamp_resume_hot >= VAMP_CANCEL_HOT_CHUNKS:
+                    self._cancel_vamp()
+            return
+        self._vamp_resume_hot = 0
+        if self._utt_hot_chunks >= self._vamp_min_speech:
+            self._utt_quiet_chunks += 1
+            if (self._vamp_trigger == "energy"
+                    and self._utt_quiet_chunks == self._vamp_silence_chunks):
+                await self._fire_vamp("energy")
 
     # -- STT event pump -----------------------------------------------------
 
@@ -362,9 +609,21 @@ class VoiceTurnLoop:
                 if ((self._pending_text or self._speech_seen)
                         and self._state == LISTENING
                         and self._finalize_task is None):
+                    # Vamp on the FIRST short-horizon VAD crossing — fires
+                    # ahead of the (2.0s-horizon) end-of-turn confirmation.
+                    if (self._vamp_trigger == "vad"
+                            and probs.get(VAMP_VAD_HORIZON, 0.0)
+                            >= VAMP_VAD_PROB):
+                        await self._fire_vamp("vad")
                     if probs.get(END_OF_TURN_HORIZON, 0.0) >= END_OF_TURN_PROB:
                         self._turn_seq += 1
                         self._t_ref = time.monotonic()
+                        self._tel_set("vad_end", self._t_ref)
+                        if self._last_hot_t is not None:
+                            # vad-end is authoritative for the cycle: a
+                            # false-fired vamp opened the record early, so
+                            # refresh the speech-end proxy.
+                            self._tel["speech_end"] = self._last_hot_t
                         self._mark("vad-end-detected",
                                    probs={k: round(v, 3) for k, v in probs.items()})
                         # Run finalize as a task: it waits for the "flushed"
@@ -423,11 +682,18 @@ class VoiceTurnLoop:
                         await asyncio.wait_for(
                             self._flushed.wait(), timeout=FLUSHED_WAIT_TIMEOUT_S)
                         self._mark("flushed-ack", flush_id=flush_id)
+                        self._tel_set("flush_result", "ack")
                     except asyncio.TimeoutError:
                         self._mark("flushed-TIMEOUT", flush_id=flush_id,
                                    last_seen=self._last_flushed_id)
-            # else: no live STT session — no "flushed" event will ever
-            # arrive (notes §15 addendum), skip the wait entirely.
+                        self._tel_set("flush_result", "timeout")
+                else:
+                    self._tel_set("flush_result", "ack")
+            else:
+                # No live STT session — no "flushed" event will ever
+                # arrive (notes §15 addendum), skip the wait entirely.
+                self._tel_set("flush_result", "skipped")
+            self._tel_set("flush_done")
             late_text = " ".join(t for t in self._pending_text if t).strip()
             if eager_text and not late_text:
                 return                    # eager turn was complete — done
@@ -460,7 +726,12 @@ class VoiceTurnLoop:
                 self._spare_agent_future = None
                 self._start_turn(utterance, record_user=True,
                                  agent_future=agent_future)
-            # else: keep the spare agent for the next finalize.
+            else:
+                # Cycle ended with no turn (keep the spare agent for the
+                # next finalize): close out the telemetry record and let
+                # the vamp fire again next utterance.
+                self._tel_emit("no-turn")
+                self._vamp_armed = True
         finally:
             self._finalize_task = None
 
@@ -510,6 +781,7 @@ class VoiceTurnLoop:
                 if not first_delta_seen.is_set():
                     first_delta_seen.set()
                     self._mark("first-delta")
+                    self._tel_set("first_delta")
                 _enqueue(("delta", delta))
 
         # Signature mirrors api_server._tool_progress (1637).
@@ -534,6 +806,7 @@ class VoiceTurnLoop:
                 agent = self._make_agent()
             agent_ref[0] = agent
             self._mark("agent-start")
+            self._tel_set("agent_start")
             if interrupt_latch.is_set():
                 # A barge-in/stop landed while the agent was still being
                 # constructed: interrupt before the first iteration runs.
@@ -565,6 +838,7 @@ class VoiceTurnLoop:
             if not first_audio_seen:
                 first_audio_seen = True
                 self._mark("first-tts-audio-chunk", bytes=len(pcm))
+                self._tel_set("tts_first_audio")
             await self._transport.send_audio(pcm)
 
         try:
@@ -620,6 +894,8 @@ class VoiceTurnLoop:
             self._tool_sink = None
             if self._state != LISTENING:
                 self._state = LISTENING
+            self._tel_emit("interrupted" if interrupted else "ok")
+            self._vamp_armed = True
 
     async def _pump_deltas_to_tts(self, q: "asyncio.Queue[tuple]") -> None:
         """Stream deltas to TTS at word granularity.
@@ -660,6 +936,8 @@ class VoiceTurnLoop:
             for m in _PUNCT_RE.finditer(fragment):
                 pass
             if m is not None:
+                if not punct_ever:
+                    self._tel_set("first_sentence")
                 punct_ever = True
                 unsynthesized = len(fragment) - m.end()
             else:
@@ -677,6 +955,7 @@ class VoiceTurnLoop:
                 first_flush_done = True
                 self._mark("first-sentence-forced-flush",
                            held_chars=unsynthesized)
+                self._tel_set("first_sentence")
                 await self._tts.send_text("<flush>")
                 unsynthesized = 0
 

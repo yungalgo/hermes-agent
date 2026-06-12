@@ -99,6 +99,11 @@ class DailyTransport:
         self._joined = threading.Event()
         self._join_error: Optional[str] = None
         self._last_audio_in_t = 0.0
+        # Telemetry write mark (notes §16 first_frame_written): the turn
+        # loop arms it at the start of a turn cycle; the writer thread
+        # stamps the first real frame write after arming.
+        self._first_write_t: Optional[float] = None
+        self._write_mark_armed = False
 
     async def join(self, room_url: str, token: str, timeout: float = 15.0) -> None:
         _ensure_daily()
@@ -199,6 +204,9 @@ class DailyTransport:
                 logger.info("voice/daily: write burst started qsize=%d",
                             self._out_q.qsize())
             t0 = time.monotonic()
+            if self._write_mark_armed:
+                self._write_mark_armed = False
+                self._first_write_t = t0
             _mic.write_frames(chunk)                          # blocking?
             dt = time.monotonic() - t0
             chunk_s = len(chunk) / 2.0 / MIC_RATE
@@ -216,6 +224,17 @@ class DailyTransport:
     async def send_audio(self, pcm: bytes) -> None:
         """Queue agent speech (s16le mono 48 kHz) for the caller."""
         self._out_q.put(pcm)
+
+    def reset_write_mark(self) -> None:
+        """Arm the first_frame_written telemetry mark for a new turn."""
+        self._first_write_t = None
+        self._write_mark_armed = True
+
+    @property
+    def first_write_t(self) -> Optional[float]:
+        """Monotonic time of the first frame written after the last
+        reset_write_mark(), or None if nothing was written yet."""
+        return self._first_write_t
 
     def clear_output(self) -> None:
         """Barge-in: drop all queued (unplayed) agent audio."""
