@@ -50,6 +50,42 @@ LONG_FLUSH_LEN = 100
 
 END_OF_TURN_HORIZON = 2.0
 END_OF_TURN_PROB = 0.7
+# ---------------------------------------------------------------------------
+# Turn detection (ENG-555): Smart Turn replaces Gradium's semantic-VAD
+# step-prob end-of-turn / barge-in logic. The Gradium step path is kept
+# behind turn_detector="gradium" as a fallback; "smart_turn" (default)
+# drives turns from a local ONNX endpoint model + a local RMS energy gate.
+# Gradium STT STILL transcribes (text events are consumed regardless) — only
+# its VAD-step-driven turn/barge DECISIONS are replaced.
+TURN_DETECTORS = ("smart_turn", "gradium")
+DEFAULT_TURN_DETECTOR = "smart_turn"
+# Continuous local silence (RMS below the floor) after speech before a Smart
+# Turn check runs. The model needs the utterance to have paused; 350 ms is
+# the natural end-of-clause gap without clipping mid-sentence pauses.
+DEFAULT_VAD_STOP_SECS = 0.35
+# Smart Turn endpoint probability (>= => turn complete). The model emits a
+# probability in [0, 1]; 0.5 is the model's own decision boundary.
+DEFAULT_SMART_TURN_THRESHOLD = 0.5
+# Speculative start: a LOWER endpoint probability that is confident enough to
+# begin the agent turn on the transcript-so-far, overlapping LLM TTFT with
+# the tail of user speech. If more speech then arrives, the speculative turn
+# is interrupted and restarted with the fuller transcript.
+DEFAULT_SPECULATIVE_START = True
+DEFAULT_SPECULATIVE_THRESHOLD = 0.55
+# Hard fallback: if local silence persists this long without Smart Turn ever
+# crossing the threshold (model false-negative, or a genuinely trailing-off
+# utterance), finalize the turn anyway. Bounds worst-case end-of-turn
+# latency to this value.
+DEFAULT_SMART_TURN_FALLBACK_SECS = 2.5
+# Re-run Smart Turn at most this often while silence holds (the model is
+# ~13 ms but we do not need it every 80 ms chunk).
+SMART_TURN_MIN_INTERVAL_S = 0.12
+# Barge-in gating during agent playback (Smart Turn path). Energy alone is
+# echo/cough-prone, so a real interruption must clear BOTH a minimum sustained
+# duration AND a minimum word count from Gradium's partial transcript.
+DEFAULT_ALLOW_INTERRUPTIONS = True
+DEFAULT_MIN_INTERRUPTION_DURATION_MS = 500
+DEFAULT_MIN_INTERRUPTION_WORDS = 2
 # Barge-in on VAD evidence of user speech during THINKING/SPEAKING: the
 # short-horizon inactivity probability collapses within ~1-2 steps of real
 # speech, while finalized `text` events can lag seconds behind (live
@@ -229,6 +265,66 @@ def _resolve_vamp_trigger(extra: Dict[str, Any]) -> str:
     return trigger
 
 
+def _resolve_float_extra(extra: Dict[str, Any], key: str, default: float) -> float:
+    raw = (extra or {}).get(key)
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning("voice/turn: invalid %s %r ignored", key, raw)
+        return default
+    if value < 0:
+        logger.warning("voice/turn: %s must be >= 0; %r ignored", key, raw)
+        return default
+    return value
+
+
+def _resolve_bool_extra(extra: Dict[str, Any], key: str, default: bool) -> bool:
+    raw = (extra or {}).get(key)
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        s = raw.strip().lower()
+        if s in ("true", "1", "yes", "on"):
+            return True
+        if s in ("false", "0", "no", "off"):
+            return False
+    logger.warning("voice/turn: invalid %s %r ignored", key, raw)
+    return default
+
+
+def _resolve_nonneg_int_extra(extra: Dict[str, Any], key: str, default: int) -> int:
+    """Like _resolve_int_extra but allows 0 (e.g. min_interruption_words=0
+    to disable the word gate, or a 0ms duration floor)."""
+    raw = (extra or {}).get(key)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("voice/turn: invalid %s %r ignored", key, raw)
+        return default
+    if value < 0:
+        logger.warning("voice/turn: %s must be >= 0; %r ignored", key, raw)
+        return default
+    return value
+
+
+def _resolve_turn_detector(extra: Dict[str, Any]) -> str:
+    raw = (extra or {}).get("turn_detector")
+    if raw is None:
+        return DEFAULT_TURN_DETECTOR
+    mode = str(raw).strip().lower()
+    if mode not in TURN_DETECTORS:
+        logger.warning("voice/turn: invalid turn_detector %r ignored "
+                       "(valid: %s)", raw, "|".join(TURN_DETECTORS))
+        return DEFAULT_TURN_DETECTOR
+    return mode
+
+
 def _resolve_max_iterations(extra: Dict[str, Any]) -> int:
     """platforms.voice.extra.max_turns caps the per-utterance agent loop;
     falls back to the api_server default (HERMES_MAX_ITERATIONS env, 90)."""
@@ -278,6 +374,24 @@ def _create_voice_agent(
     )
 
 
+def _build_turn_detector():
+    """Construct the Smart Turn detector + rolling 16 kHz buffer. Isolated
+    in a module function so tests monkeypatch it with fakes (the real
+    detector pulls onnxruntime/transformers, which the loop logic does not
+    need)."""
+    try:
+        import turn_detection
+    except ImportError:
+        from . import turn_detection
+    return turn_detection.SmartTurnDetector(), turn_detection.RollingAudioBuffer()
+
+
+def _rms_for_detector(pcm: bytes) -> float:
+    """RMS gate for the Smart Turn path (matches turn_detection.rms_energy /
+    the legacy _rms here)."""
+    return _rms(pcm)
+
+
 class VoiceTurnLoop:
     def __init__(self, stt, tts_factory, transport, *, extra: Dict[str, Any],
                  vamp=None):
@@ -321,6 +435,52 @@ class VoiceTurnLoop:
         self._vamp_veto_deferred = 0
         self._energy_barge_chunks = _resolve_int_extra(
             self._extra, "barge_energy_chunks", ENERGY_BARGE_CHUNKS)
+        # -- Smart Turn detection (ENG-555) --------------------------------
+        self._turn_detector_mode = _resolve_turn_detector(self._extra)
+        self._vad_stop_secs = _resolve_float_extra(
+            self._extra, "vad_stop_secs", DEFAULT_VAD_STOP_SECS)
+        self._smart_turn_threshold = _resolve_float_extra(
+            self._extra, "smart_turn_threshold", DEFAULT_SMART_TURN_THRESHOLD)
+        self._speculative_start = _resolve_bool_extra(
+            self._extra, "speculative_start", DEFAULT_SPECULATIVE_START)
+        self._speculative_threshold = _resolve_float_extra(
+            self._extra, "speculative_threshold", DEFAULT_SPECULATIVE_THRESHOLD)
+        self._smart_turn_fallback_secs = _resolve_float_extra(
+            self._extra, "smart_turn_fallback_secs",
+            DEFAULT_SMART_TURN_FALLBACK_SECS)
+        self._allow_interruptions = _resolve_bool_extra(
+            self._extra, "allow_interruptions", DEFAULT_ALLOW_INTERRUPTIONS)
+        self._min_interruption_words = _resolve_nonneg_int_extra(
+            self._extra, "min_interruption_words",
+            DEFAULT_MIN_INTERRUPTION_WORDS)
+        self._min_interruption_duration_ms = _resolve_nonneg_int_extra(
+            self._extra, "min_interruption_duration_ms",
+            DEFAULT_MIN_INTERRUPTION_DURATION_MS)
+        # Detector + 8s rolling buffer built lazily (the real one pulls
+        # onnxruntime); tests inject a fake via _build_turn_detector. Only
+        # built when turn_detector="smart_turn".
+        self._detector = None
+        self._audio_buffer = None
+        # Energy-silence onset state (LISTENING): how long inbound audio has
+        # been continuously quiet since the last hot chunk, and the last time
+        # a Smart Turn check ran (rate-limit). _smart_speech_seen gates the
+        # detector to fire only after the user actually spoke this cycle.
+        self._silence_run_started: Optional[float] = None
+        self._last_smart_check_t: float = 0.0
+        self._smart_speech_seen = False
+        self._smart_check_inflight = False
+        # Speculative-start bookkeeping: the speculative turn's transcript and
+        # whether a speculative turn is currently live (so resumed speech can
+        # restart it). Per-turn telemetry counters banked into the record.
+        self._speculative_active = False
+        self._speculative_text = ""
+        self._spec_started_count = 0
+        self._spec_restarted_count = 0
+        # Barge-in gating (Smart Turn path): when the current run of inbound
+        # energy during agent playback began (for min_interruption_duration_ms)
+        # and the word count of the partial transcript heard during it.
+        self._barge_energy_started: Optional[float] = None
+        self._barge_partial_words = 0
         # Telemetry (notes §16): one structured record per turn cycle,
         # opened at the first cycle event (vamp fire or vad-end), emitted
         # as a JSON log line when the turn ends; per-call summary on stop.
@@ -413,6 +573,10 @@ class VoiceTurnLoop:
             "turn": self._turn_seq,
             "status": status,
             "eager_start": bool(tel.get("eager_start")),
+            "turn_detector": tel.get("turn_detector", self._turn_detector_mode),
+            "eot_reason": tel.get("eot_reason"),
+            "speculative_started": bool(tel.get("speculative_started")),
+            "speculative_restarted": bool(tel.get("speculative_restarted")),
             "vad_end_ms": off(tel.get("vad_end")),
             "flush_result": tel.get("flush_result"),
             "flush_done_ms": off(tel.get("flush_done")),
@@ -557,7 +721,34 @@ class VoiceTurnLoop:
 
     # -- main ---------------------------------------------------------------
 
+    def _ensure_detector(self) -> None:
+        """Build the Smart Turn detector + rolling buffer and warm the ONNX
+        session on a worker thread. Model load (~hundreds of ms) overlaps the
+        greeting so the first user turn never waits on it. Fail-soft: a build
+        failure logs and leaves the detector None — _run_smart_turn then
+        returns None and the hard fallback still finalizes turns."""
+        if self._turn_detector_mode != "smart_turn" or self._detector is not None:
+            return
+        try:
+            detector, buffer = _build_turn_detector()
+        except Exception:
+            logger.exception("voice/turn: smart-turn detector build failed; "
+                             "end-of-turn falls back to the silence timeout")
+            return
+        self._detector = detector
+        self._audio_buffer = buffer
+
+        def _warm() -> None:
+            try:
+                detector.load()
+            except Exception:
+                logger.exception("voice/turn: smart-turn model warm-up failed")
+
+        threading.Thread(target=_warm, name="voice-smart-turn-warm",
+                         daemon=True).start()
+
     async def run(self) -> None:
+        self._ensure_detector()
         consumer = asyncio.create_task(self._consume_stt())
         canned = self._extra.get("greeting_text")
         if canned:
@@ -615,33 +806,65 @@ class VoiceTurnLoop:
 
     async def on_inbound_audio(self, pcm: bytes) -> None:
         """Called by the adapter for every inbound 80ms caller chunk, in
-        parallel with STT. Two energy-based fast paths live here:
-          THINKING/SPEAKING: sustained energy = the user talking over the
-            agent -> barge in WITHOUT waiting for the STT round-trip
-            (0.6-1.8s measured live).
-          LISTENING: quiet chunks after speech = silence onset -> fire the
-            vamp clip (the inverse trigger); hot chunks while a vamp clip
-            is still playing = false fire -> drop the remaining clip."""
+        parallel with STT. In Smart Turn mode this owns BOTH turn decisions:
+          THINKING/SPEAKING: sustained energy (gated by min duration + the
+            partial-transcript word count) = the user talking over the agent
+            -> barge in WITHOUT the STT round-trip.
+          LISTENING: the chunk feeds the rolling 16kHz buffer; continuous
+            silence after speech (>= vad_stop_secs) runs the Smart Turn ONNX
+            endpoint model -> speculative start / finalize / hard fallback.
+            Quiet chunks after speech also fire the vamp clip (inverse
+            trigger); hot chunks while a vamp clip plays = false fire."""
         hot = _rms(pcm) >= ENERGY_BARGE_RMS
+        # Feed the rolling window (Smart Turn path only) for every chunk so
+        # the 8s endpoint window is always current when a check runs.
+        if self._turn_detector_mode == "smart_turn" and self._audio_buffer is not None:
+            self._audio_buffer.push(pcm)
         if self._state in (THINKING, SPEAKING):
             self._utt_hot_chunks = 0
             self._utt_quiet_chunks = 0
-            if not hot:
-                self._energy_hot_chunks = 0
+            if self._turn_detector_mode == "gradium":
+                # Fallback path: bare consecutive-hot-chunk barge-in.
+                if not hot:
+                    self._energy_hot_chunks = 0
+                    return
+                self._energy_hot_chunks += 1
+                if self._energy_hot_chunks >= self._energy_barge_chunks:
+                    self._energy_hot_chunks = 0
+                    self._mark("barge-in-trigger", source="energy",
+                               state=self._state)
+                    await self._barge_in()
                 return
-            self._energy_hot_chunks += 1
-            if self._energy_hot_chunks >= self._energy_barge_chunks:
-                self._energy_hot_chunks = 0
-                self._mark("barge-in-trigger", source="energy",
-                           state=self._state)
-                await self._barge_in()
+            # Smart Turn path: energy starts/extends a barge run; the run
+            # must clear BOTH min_interruption_duration_ms AND
+            # min_interruption_words (from the partial transcript heard
+            # during the run) before it counts as an interruption.
+            now = time.monotonic()
+            if hot:
+                if self._barge_energy_started is None:
+                    self._barge_energy_started = now
+                    self._barge_partial_words = 0
+                await self._maybe_energy_barge_in()
+            else:
+                # A brief dip is tolerated as long as the run is short; a
+                # sustained gap (>= one vad_stop window) resets the run so a
+                # cough does not accumulate toward an interruption.
+                if (self._barge_energy_started is not None
+                        and now - self._barge_energy_started
+                        > self._min_interruption_duration_ms / 1000.0
+                        + self._vad_stop_secs):
+                    self._barge_energy_started = None
+                    self._barge_partial_words = 0
             return
         self._energy_hot_chunks = 0
+        self._barge_energy_started = None
         now = time.monotonic()
         if hot:
             self._last_hot_t = now
             self._utt_hot_chunks += 1
             self._utt_quiet_chunks = 0
+            self._smart_speech_seen = True
+            self._silence_run_started = None
             if now < self._vamp_playing_until:
                 self._vamp_resume_hot += 1
                 if self._vamp_resume_hot >= VAMP_CANCEL_HOT_CHUNKS:
@@ -655,6 +878,176 @@ class VoiceTurnLoop:
                     self._vamp_veto_deferred += 1
                 else:
                     await self._fire_vamp("energy")
+        # Smart Turn end-of-turn: continuous local silence after speech runs
+        # the endpoint model (rate-limited), or hits the hard fallback.
+        if self._turn_detector_mode == "smart_turn":
+            await self._smart_turn_on_silence(now)
+
+    async def _maybe_energy_barge_in(self) -> None:
+        """Smart Turn barge-in gate: interrupt the agent only when a run of
+        inbound energy has lasted >= min_interruption_duration_ms AND the
+        partial transcript heard during it has >= min_interruption_words.
+        Kills false barge-in on a single um/cough/echo.
+
+        When a SPECULATIVE turn is live, the same trigger means the user kept
+        talking past the speculative cut: interrupt and RESTART the turn with
+        the fuller transcript instead of just ending it (speculative_restarted
+        telemetry). For a normal turn it is a plain barge-in."""
+        if (not self._allow_interruptions
+                or self._state not in (THINKING, SPEAKING)
+                or self._barge_energy_started is None):
+            return
+        elapsed_ms = (time.monotonic() - self._barge_energy_started) * 1000.0
+        if (elapsed_ms < self._min_interruption_duration_ms
+                or self._barge_partial_words < self._min_interruption_words):
+            return
+        words = self._barge_partial_words
+        self._barge_energy_started = None
+        self._barge_partial_words = 0
+        if self._speculative_active:
+            await self._restart_speculative_turn(words, int(elapsed_ms))
+            return
+        self._mark("barge-in-trigger", source="smart-energy",
+                   state=self._state, words=words, ms=int(elapsed_ms))
+        await self._barge_in()
+
+    async def _restart_speculative_turn(self, words: int, ms: int) -> None:
+        """The user kept speaking past a speculative start: interrupt the
+        speculative turn (which has not produced substantive audio the user
+        would notice cut — that is the whole point of the lower threshold)
+        and restart on the accumulated transcript. The interrupted turn's
+        _execute_turn re-queues its (unspoken) user_message into _pending_text,
+        so the restart sees the full utterance."""
+        self._spec_restarted_count += 1
+        self._tel_set("speculative_restarted", True)
+        self._mark("speculative-restart", words=words, ms=ms)
+        await self._barge_in()
+        # _execute_turn's interrupt path re-inserts the speculative
+        # user_message at the head of _pending_text when no audio was heard.
+        text = " ".join(t for t in self._pending_text if t).strip()
+        self._pending_text.clear()
+        self._speech_seen = False
+        self._speech_steps = 0
+        self._speculative_active = False
+        self._smart_speech_seen = False
+        self._silence_run_started = None
+        if not text:
+            return
+        agent_future = self._spare_agent_future
+        self._spare_agent_future = None
+        self._start_turn(text, record_user=True, agent_future=agent_future)
+
+    async def _smart_turn_on_silence(self, now: float) -> None:
+        """Drive end-of-turn from local silence + the Smart Turn ONNX model.
+
+        Runs only while LISTENING with no finalize in flight, after the user
+        has actually spoken this cycle. Once silence has held vad_stop_secs,
+        run the endpoint model (rate-limited to SMART_TURN_MIN_INTERVAL_S):
+          - prob >= smart_turn_threshold -> finalize the turn;
+          - prob >= speculative_threshold (and not yet started) -> start the
+            agent speculatively on the transcript-so-far (restart handled by
+            the resumed-speech path / finalize);
+          - silence past smart_turn_fallback_secs -> finalize regardless
+            (covers a Smart Turn false-negative / a trailing-off utterance)."""
+        if (self._state != LISTENING or self._finalize_task is not None
+                or not self._smart_speech_seen):
+            return
+        if self._silence_run_started is None:
+            self._silence_run_started = now
+        silence_held = now - self._silence_run_started
+        if silence_held < self._vad_stop_secs:
+            return
+        # Hard fallback: finalize regardless of the model's verdict.
+        if silence_held >= self._smart_turn_fallback_secs:
+            self._mark("smart-turn-fallback", silence_ms=int(silence_held * 1000))
+            self._begin_finalize(reason="fallback")
+            return
+        if (now - self._last_smart_check_t < SMART_TURN_MIN_INTERVAL_S
+                or self._smart_check_inflight):
+            return
+        self._last_smart_check_t = now
+        prob = await self._run_smart_turn()
+        if prob is None:
+            return
+        if prob >= self._smart_turn_threshold:
+            self._mark("smart-turn-complete", prob=round(prob, 3))
+            self._begin_finalize(reason="endpoint")
+        elif (self._speculative_start and not self._speculative_active
+                and prob >= self._speculative_threshold):
+            self._begin_speculative_start(prob)
+
+    async def _run_smart_turn(self) -> Optional[float]:
+        """Run the ONNX endpoint model on the current 16kHz window in the
+        executor. Returns the probability, or None when the detector is
+        unavailable / the window is empty (treated as not-end-of-turn)."""
+        if self._detector is None or self._audio_buffer is None:
+            return None
+        window = self._audio_buffer.window_16k()
+        if window is None or len(window) == 0:
+            return None
+        self._smart_check_inflight = True
+        try:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(
+                None, self._detector.predict_endpoint, window)
+        except Exception:
+            logger.exception("voice/turn: smart-turn inference failed")
+            return None
+        finally:
+            self._smart_check_inflight = False
+
+    def _begin_finalize(self, *, reason: str) -> None:
+        """Open the turn-cycle telemetry record and launch _finalize_user_turn
+        (Smart Turn path). Mirrors the bookkeeping the Gradium vad-end block
+        did inline, then resets the per-cycle silence/speech gate so the next
+        utterance starts clean."""
+        self._turn_seq += 1
+        self._t_ref = time.monotonic()
+        self._tel_set("vad_end", self._t_ref)
+        self._tel_set("turn_detector", "smart_turn")
+        self._tel_set("eot_reason", reason)
+        if self._last_hot_t is not None:
+            self._tel["speech_end"] = self._last_hot_t
+        self._mark("smart-turn-end", reason=reason)
+        self._smart_speech_seen = False
+        self._silence_run_started = None
+        if self._audio_buffer is not None:
+            self._audio_buffer.clear()
+        self._finalize_task = asyncio.create_task(self._finalize_user_turn())
+
+    def _begin_speculative_start(self, prob: float) -> None:
+        """Speculative start: begin the agent turn on the transcript-so-far
+        before full end-of-turn confidence, overlapping LLM TTFT with the
+        tail of user speech. The turn stays cancellable: if more speech
+        arrives (energy resumes -> a new utterance cycle), finalize/​barge-in
+        interrupts and restarts it with the fuller transcript."""
+        text = " ".join(t for t in self._pending_text if t).strip()
+        if not text:
+            return                       # nothing to speculate on yet
+        self._turn_seq += 1
+        self._t_ref = time.monotonic()
+        self._tel_set("vad_end", self._t_ref)
+        self._tel_set("turn_detector", "smart_turn")
+        self._tel_set("speculative_started", True)
+        if self._last_hot_t is not None:
+            self._tel["speech_end"] = self._last_hot_t
+        self._speculative_active = True
+        self._speculative_text = text
+        self._spec_started_count += 1
+        self._smart_speech_seen = False
+        # Clear the accumulated transcript: the speculative turn now OWNS this
+        # text. A restart rebuilds the full utterance from the speculative
+        # text (re-queued by _execute_turn on interrupt) + any tail that
+        # arrives after — see the text handler / _restart_speculative_turn.
+        self._pending_text.clear()
+        self._speech_seen = False
+        self._speech_steps = 0
+        self._mark("speculative-start", prob=round(prob, 3), chars=len(text))
+        agent_future = self._spare_agent_future
+        self._spare_agent_future = None
+        # record_user is deferred to the final (possibly restarted) turn so a
+        # restart does not double-log the user utterance.
+        self._start_turn(text, record_user=True, agent_future=agent_future)
 
     def _vamp_energy_in_window(self) -> bool:
         """True while the energy trigger may (still) fire this cycle."""
@@ -679,17 +1072,44 @@ class VoiceTurnLoop:
         async for msg in self._stt.events():
             mtype = msg.get("type")
             if mtype == "text":
-                # While finalize awaits the flush ack, text events are the
-                # forced tail of the utterance that ALREADY started the
-                # eager turn — not a new interjection. Finalize handles the
-                # restart; real interruptions in that window are caught by
-                # the (faster) VAD-step trigger below.
-                if (self._state in (THINKING, SPEAKING)
-                        and self._finalize_task is None):
-                    self._mark("barge-in-trigger", source="stt-text",
-                               state=self._state)
-                    await self._barge_in()
-                self._pending_text.append(msg.get("text", ""))
+                text = msg.get("text", "")
+                # Smart Turn path: a partial transcript heard DURING agent
+                # playback feeds the barge-in word gate (energy alone is
+                # cough/echo-prone). It must not by itself trigger a barge —
+                # the energy detector owns that decision once the word +
+                # duration thresholds are both met.
+                if self._turn_detector_mode == "smart_turn":
+                    if (self._state in (THINKING, SPEAKING)
+                            and self._finalize_task is None):
+                        self._barge_partial_words += len(text.split())
+                        # A speculative turn used the transcript-so-far; a
+                        # transcript TAIL that arrives after it started proves
+                        # the user kept talking past the speculative cut, even
+                        # if the energy run already lapsed. Restart on the
+                        # fuller utterance so the speculative generation is not
+                        # answering a truncated question.
+                        if self._speculative_active:
+                            self._pending_text.append(text)
+                            full = " ".join(
+                                t for t in self._pending_text if t).strip()
+                            if (full != self._speculative_text
+                                    and len(text.split())
+                                    >= self._min_interruption_words):
+                                await self._restart_speculative_turn(
+                                    len(text.split()), 0)
+                            continue
+                        await self._maybe_energy_barge_in()
+                else:
+                    # Gradium path: finalized text during THINKING/SPEAKING is
+                    # an interjection. While finalize awaits the flush ack,
+                    # text events are the forced tail of the utterance that
+                    # ALREADY started the eager turn — not a new interjection.
+                    if (self._state in (THINKING, SPEAKING)
+                            and self._finalize_task is None):
+                        self._mark("barge-in-trigger", source="stt-text",
+                                   state=self._state)
+                        await self._barge_in()
+                self._pending_text.append(text)
             elif mtype == "step":
                 await self._stt.maybe_rotate(msg)
                 # Horizons looked up by value (FOUR arrive live, §15).
@@ -718,6 +1138,21 @@ class VoiceTurnLoop:
                         if (self._state == LISTENING
                                 and self._vamp_energy_in_window()):
                             await self._fire_vamp("energy")
+                # Vamp on the FIRST short-horizon VAD crossing (independent
+                # of the turn detector — vamp_trigger="vad" still works under
+                # Smart Turn): fires ahead of the end-of-turn confirmation.
+                if (self._vamp_trigger == "vad"
+                        and self._state == LISTENING
+                        and self._finalize_task is None
+                        and (self._pending_text or self._smart_speech_seen)
+                        and probs.get(VAMP_VAD_HORIZON, 0.0) >= VAMP_VAD_PROB):
+                    await self._fire_vamp("vad")
+                # Gradium step-driven barge-in + end-of-turn are REPLACED by
+                # Smart Turn (ENG-555); kept only behind turn_detector=gradium
+                # as a fallback. The Smart Turn path drives both from the
+                # local energy gate + ONNX endpoint model in on_inbound_audio.
+                if self._turn_detector_mode != "gradium":
+                    continue
                 if p_short is not None and p_short <= BARGE_VAD_SPEECH_PROB:
                     self._speech_steps += 1
                 else:
@@ -732,12 +1167,6 @@ class VoiceTurnLoop:
                 if ((self._pending_text or self._speech_seen)
                         and self._state == LISTENING
                         and self._finalize_task is None):
-                    # Vamp on the FIRST short-horizon VAD crossing — fires
-                    # ahead of the (2.0s-horizon) end-of-turn confirmation.
-                    if (self._vamp_trigger == "vad"
-                            and probs.get(VAMP_VAD_HORIZON, 0.0)
-                            >= VAMP_VAD_PROB):
-                        await self._fire_vamp("vad")
                     if probs.get(END_OF_TURN_HORIZON, 0.0) >= END_OF_TURN_PROB:
                         self._turn_seq += 1
                         self._t_ref = time.monotonic()
@@ -1018,6 +1447,12 @@ class VoiceTurnLoop:
             self._tool_sink = None
             if self._state != LISTENING:
                 self._state = LISTENING
+            # Clear the speculative flag once the (possibly restarted) turn
+            # ends: a speculative turn that ran to completion needs the flag
+            # cleared so the next utterance is not mistaken for a restart.
+            self._speculative_active = False
+            self._barge_energy_started = None
+            self._barge_partial_words = 0
             self._tel_emit("interrupted" if interrupted else "ok")
             self._vamp_armed = True
 

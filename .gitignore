@@ -129,3 +129,8 @@ scripts/out/
 # stores the published notes. They are not a build artifact and must never be
 # committed to the repo root. See the hermes-release skill.
 RELEASE_v*.md
+
+# Smart Turn ONNX model (ENG-555): baked into the Docker image at build
+# time (Dockerfile) or downloaded to the HF cache at runtime as a fallback.
+# Never committed — it is an 8.7MB binary artifact, not source.
+plugins/platforms/voice/models/

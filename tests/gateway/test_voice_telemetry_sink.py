@@ -96,7 +96,10 @@ async def test_turn_and_call_summary_records_reach_the_file(
     install_agents(monkeypatch, [
         say(GREETING_REPLY), say("It is quarter past three.")])
     stt, factory, transport = FakeSTT(), FakeTTSFactory(), FakeTransport()
-    vloop = turn_loop.VoiceTurnLoop(stt, factory, transport, extra={})
+    # Drives end-of-turn via Gradium VAD steps (the telemetry record shape is
+    # detector-agnostic); pin the legacy detector so the step path is active.
+    vloop = turn_loop.VoiceTurnLoop(
+        stt, factory, transport, extra={"turn_detector": "gradium"})
     task = asyncio.create_task(vloop.run())
     try:
         await _eventually(lambda: vloop._state == turn_loop.LISTENING

@@ -216,6 +216,20 @@ RUN chmod -R a+rX /opt/hermes && \
 # this a fast (~1s) egg-link creation with no resolution or downloads.
 RUN uv pip install --no-cache-dir --no-deps -e "."
 
+# ---------- Bake the Smart Turn end-of-turn model (ENG-555) ----------
+# The voice platform's local end-of-turn detector loads a bundled
+# pipecat-ai/smart-turn-v3 ONNX (CPU, ~8.7MB) — see
+# plugins/platforms/voice/turn_detection.py. Baking it at build time keeps
+# the runtime fully offline: the published image must never reach the HF
+# Hub on the call path (network is often blocked in containerized envs, and
+# a cold download would add seconds of first-turn latency / silent failure).
+# huggingface_hub ships transitively with the transformers pin in
+# [voice-platform]; download into the path turn_detection.BAKED_MODEL_PATH
+# resolves first. Pinned filename so the bake matches the runtime loader.
+RUN mkdir -p /opt/hermes/plugins/platforms/voice/models && \
+    /opt/hermes/.venv/bin/python -c "from huggingface_hub import hf_hub_download; import shutil; p = hf_hub_download(repo_id='pipecat-ai/smart-turn-v3', filename='smart-turn-v3.2-cpu.onnx'); shutil.copy(p, '/opt/hermes/plugins/platforms/voice/models/smart-turn-v3.2-cpu.onnx')" && \
+    chmod a+r /opt/hermes/plugins/platforms/voice/models/smart-turn-v3.2-cpu.onnx
+
 # ---------- Bake build-time git revision ----------
 # .dockerignore excludes .git, so `git rev-parse HEAD` from inside the
 # container always returns nothing — meaning `hermes dump` reports

@@ -735,7 +735,21 @@ platform_toolsets:
 #       idle_teardown_s: 60         # end the call after this many seconds with no human participant
 #                                   # (tab closed / never joined) — stops billable ASR on abandoned calls
 #       max_call_s: 1800            # hard cap on call duration in seconds (cost guard)
-#       barge_energy_chunks: 2      # consecutive hot 80ms chunks to barge in (1 = experimental fast trigger)
+#       barge_energy_chunks: 2      # consecutive hot 80ms chunks to barge in (gradium detector only)
+#       # Turn detection (ENG-555): local Smart Turn ONNX endpoint model +
+#       # an RMS energy gate REPLACE Gradium semantic-VAD turn/barge logic.
+#       # Gradium STT still transcribes; only its VAD-step turn decisions are
+#       # replaced. All keys have safe defaults — omit them entirely to use
+#       # Smart Turn out of the box.
+#       turn_detector: smart_turn   # smart_turn (default) | gradium (legacy VAD fallback)
+#       vad_stop_secs: 0.35         # continuous local silence after speech before a Smart Turn check runs
+#       smart_turn_threshold: 0.5   # endpoint probability (>=) that finalizes the turn
+#       smart_turn_fallback_secs: 2.5  # hard cap: finalize after this much silence regardless of the model
+#       speculative_start: true     # start the agent on the transcript-so-far at a lower confidence
+#       speculative_threshold: 0.55 # endpoint probability that triggers a speculative start
+#       allow_interruptions: true   # let caller speech barge in during agent playback
+#       min_interruption_words: 2   # partial-transcript words required to count a barge-in (kills um/cough)
+#       min_interruption_duration_ms: 500  # sustained caller energy required to count a barge-in
 #       # Vamp: pre-synthesized acknowledgment clips ("Mm — let me think.")
 #       # played on a fast end-of-turn signal so the caller hears audio
 #       # quickly while the substantive reply streams in behind it.

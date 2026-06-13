@@ -196,8 +196,79 @@ async def _eventually(cond, timeout=5.0, msg="condition not met"):
 
 
 def _make_loop(stt, factory, transport, extra=None):
+    # Default these legacy turn-loop tests to the Gradium VAD path: they
+    # assert Gradium step-prob-driven end-of-turn / barge-in, which ENG-555
+    # kept behind turn_detector="gradium" as a fallback. Smart Turn behavior
+    # (the new default) has its own dedicated tests below. A test can still
+    # pass turn_detector explicitly to override.
+    merged = {"turn_detector": "gradium"}
+    merged.update(extra or {})
     return turn_loop.VoiceTurnLoop(
-        stt, factory, transport, extra=extra or {})
+        stt, factory, transport, extra=merged)
+
+
+# ---------------------------------------------------------------------------
+# Smart Turn fakes (ENG-555): the loop logic is tested WITHOUT loading the
+# real ONNX model. _build_turn_detector is monkeypatched to return these.
+# ---------------------------------------------------------------------------
+
+
+class FakeDetector:
+    """Scriptable Smart Turn endpoint model. ``prob`` is returned by every
+    predict_endpoint call; ``set_prob`` changes it mid-test. Records calls."""
+
+    def __init__(self, prob=0.0):
+        self.prob = prob
+        self.calls = 0
+        self.loaded = False
+
+    def load(self):
+        self.loaded = True
+
+    def set_prob(self, prob):
+        self.prob = prob
+
+    def predict_endpoint(self, window):
+        self.calls += 1
+        return self.prob
+
+
+class FakeBuffer:
+    """Stand-in RollingAudioBuffer: window_16k() returns a non-empty marker
+    so _run_smart_turn proceeds to the (fake) detector. Tracks push/clear."""
+
+    def __init__(self):
+        self.pushed = 0
+        self.cleared = 0
+        self._nonempty = [0.0]
+
+    def push(self, pcm):
+        self.pushed += 1
+
+    def window_16k(self):
+        return self._nonempty
+
+    def clear(self):
+        self.cleared += 1
+
+
+def install_detector(monkeypatch, prob=0.0):
+    """Monkeypatch _build_turn_detector to hand the loop a FakeDetector +
+    FakeBuffer. Returns the detector so the test can drive its probability."""
+    detector = FakeDetector(prob=prob)
+    buffer = FakeBuffer()
+    monkeypatch.setattr(turn_loop, "_build_turn_detector",
+                        lambda: (detector, buffer))
+    return detector, buffer
+
+
+def _smart_loop(stt, factory, transport, monkeypatch, *, prob=0.0, extra=None):
+    """A VoiceTurnLoop in Smart Turn mode with a fake detector installed."""
+    detector, buffer = install_detector(monkeypatch, prob=prob)
+    merged = {"turn_detector": "smart_turn"}
+    merged.update(extra or {})
+    vloop = turn_loop.VoiceTurnLoop(stt, factory, transport, extra=merged)
+    return vloop, detector, buffer
 
 
 # ---------------------------------------------------------------------------
@@ -1009,3 +1080,331 @@ async def test_stop_cancels_pending_finalize_before_barge_in(monkeypatch):
     assert vloop._turn_task is None
     assert len(agents) == 2
     assert vloop._history == [{"role": "assistant", "content": GREETING_REPLY}]
+
+
+# ---------------------------------------------------------------------------
+# Smart Turn end-of-turn (ENG-555): the local ONNX endpoint model + RMS gate
+# replace Gradium step-prob turn detection. Gradium STT still transcribes.
+# ---------------------------------------------------------------------------
+
+
+async def _await_greeting(vloop, agents):
+    await _eventually(lambda: vloop._state == turn_loop.LISTENING
+                      and len(vloop._history) == 1,
+                      msg="greeting never settled to LISTENING")
+
+
+@pytest.mark.asyncio
+async def test_smart_turn_config_defaults(monkeypatch):
+    """Missing keys resolve to documented defaults; mode is smart_turn."""
+    stt, factory, transport = FakeSTT(), FakeTTSFactory(), FakeTransport()
+    install_detector(monkeypatch)
+    vloop = turn_loop.VoiceTurnLoop(stt, factory, transport, extra={})
+    assert vloop._turn_detector_mode == "smart_turn"
+    assert vloop._vad_stop_secs == turn_loop.DEFAULT_VAD_STOP_SECS
+    assert vloop._smart_turn_threshold == turn_loop.DEFAULT_SMART_TURN_THRESHOLD
+    assert vloop._speculative_start is True
+    assert vloop._speculative_threshold == turn_loop.DEFAULT_SPECULATIVE_THRESHOLD
+    assert vloop._smart_turn_fallback_secs == \
+        turn_loop.DEFAULT_SMART_TURN_FALLBACK_SECS
+    assert vloop._allow_interruptions is True
+    assert vloop._min_interruption_words == turn_loop.DEFAULT_MIN_INTERRUPTION_WORDS
+    assert vloop._min_interruption_duration_ms == \
+        turn_loop.DEFAULT_MIN_INTERRUPTION_DURATION_MS
+
+
+@pytest.mark.asyncio
+async def test_smart_turn_finalizes_on_endpoint_threshold(monkeypatch):
+    """Energy -> silence -> Smart Turn prob >= threshold finalizes the turn.
+    No Gradium step event is involved."""
+    agents = install_agents(monkeypatch, [
+        say(GREETING_REPLY), say("You asked a complete question.")])
+    stt, factory, transport = FakeSTT(), FakeTTSFactory(), FakeTransport()
+    # prob 0.0 initially (not end-of-turn); flip to complete after speech.
+    vloop, detector, buffer = _smart_loop(
+        stt, factory, transport, monkeypatch, prob=0.0,
+        extra={"vad_stop_secs": 0.0, "speculative_start": False})
+    task = asyncio.create_task(vloop.run())
+    try:
+        await _await_greeting(vloop, agents)
+        # The user speaks (hot chunks set _smart_speech_seen) ...
+        stt.push_text("Is the build done")
+        await asyncio.sleep(0.05)          # let _consume_stt drain the text
+        for _ in range(3):
+            await vloop.on_inbound_audio(LOUD_CHUNK)
+        # ... then goes silent and the model now says the turn is complete.
+        detector.set_prob(0.9)
+        await vloop.on_inbound_audio(QUIET_CHUNK)
+        await _eventually(lambda: len(agents) == 2 and agents[1].run_kwargs,
+                          msg="smart-turn never finalized the user turn")
+        assert detector.calls >= 1
+        assert agents[1].run_kwargs["user_message"] == "Is the build done"
+        # Gradium-step end-of-turn was NOT used (no step pushed at all).
+    finally:
+        await vloop.stop()
+        await task
+
+
+@pytest.mark.asyncio
+async def test_smart_turn_below_threshold_does_not_finalize(monkeypatch):
+    """Silence with a low endpoint probability must NOT finalize (and must
+    not hit the fallback before its deadline)."""
+    agents = install_agents(monkeypatch, [say(GREETING_REPLY)])
+    stt, factory, transport = FakeSTT(), FakeTTSFactory(), FakeTransport()
+    vloop, detector, buffer = _smart_loop(
+        stt, factory, transport, monkeypatch, prob=0.1,
+        extra={"vad_stop_secs": 0.0, "speculative_start": False,
+               "smart_turn_fallback_secs": 100.0})
+    task = asyncio.create_task(vloop.run())
+    try:
+        await _await_greeting(vloop, agents)
+        stt.push_text("um")
+        await asyncio.sleep(0.05)
+        for _ in range(3):
+            await vloop.on_inbound_audio(LOUD_CHUNK)
+        for _ in range(5):
+            await vloop.on_inbound_audio(QUIET_CHUNK)
+        await asyncio.sleep(0.1)
+        assert len(agents) == 1            # no turn finalized
+        assert detector.calls >= 1         # but the model WAS consulted
+    finally:
+        await vloop.stop()
+        await task
+
+
+@pytest.mark.asyncio
+async def test_smart_turn_hard_fallback_finalizes(monkeypatch):
+    """Even when the model never crosses threshold, persistent silence past
+    smart_turn_fallback_secs finalizes the turn (false-negative guard)."""
+    agents = install_agents(monkeypatch, [
+        say(GREETING_REPLY), say("Heard you despite the low model score.")])
+    stt, factory, transport = FakeSTT(), FakeTTSFactory(), FakeTransport()
+    vloop, detector, buffer = _smart_loop(
+        stt, factory, transport, monkeypatch, prob=0.0,
+        extra={"vad_stop_secs": 0.0, "speculative_start": False,
+               "smart_turn_fallback_secs": 0.0})
+    task = asyncio.create_task(vloop.run())
+    try:
+        await _await_greeting(vloop, agents)
+        stt.push_text("trailing off question")
+        await asyncio.sleep(0.05)
+        for _ in range(3):
+            await vloop.on_inbound_audio(LOUD_CHUNK)
+        await vloop.on_inbound_audio(QUIET_CHUNK)   # silence onset -> fallback
+        await _eventually(lambda: len(agents) == 2 and agents[1].run_kwargs,
+                          msg="hard fallback never finalized the turn")
+        assert agents[1].run_kwargs["user_message"] == "trailing off question"
+    finally:
+        await vloop.stop()
+        await task
+
+
+@pytest.mark.asyncio
+async def test_smart_turn_requires_speech_first(monkeypatch):
+    """Silence with no prior speech this cycle must not run the detector or
+    finalize (a fresh LISTENING state on pure room noise is not a turn)."""
+    agents = install_agents(monkeypatch, [say(GREETING_REPLY)])
+    stt, factory, transport = FakeSTT(), FakeTTSFactory(), FakeTransport()
+    vloop, detector, buffer = _smart_loop(
+        stt, factory, transport, monkeypatch, prob=0.99,
+        extra={"vad_stop_secs": 0.0, "smart_turn_fallback_secs": 0.0})
+    task = asyncio.create_task(vloop.run())
+    try:
+        await _await_greeting(vloop, agents)
+        for _ in range(10):
+            await vloop.on_inbound_audio(QUIET_CHUNK)
+        await asyncio.sleep(0.1)
+        assert len(agents) == 1
+        assert detector.calls == 0
+    finally:
+        await vloop.stop()
+        await task
+
+
+@pytest.mark.asyncio
+async def test_gradium_step_does_not_drive_turn_in_smart_mode(monkeypatch):
+    """A Gradium end-of-turn step must NOT finalize a turn when the detector
+    is Smart Turn — the step path is gated off."""
+    agents = install_agents(monkeypatch, [say(GREETING_REPLY)])
+    stt, factory, transport = FakeSTT(), FakeTTSFactory(), FakeTransport()
+    vloop, detector, buffer = _smart_loop(
+        stt, factory, transport, monkeypatch, prob=0.0,
+        extra={"vad_stop_secs": 0.0})
+    task = asyncio.create_task(vloop.run())
+    try:
+        await _await_greeting(vloop, agents)
+        stt.push_text("a question")
+        # A Gradium end-of-turn step (would finalize under gradium mode):
+        stt.push_end_of_turn_step()
+        await asyncio.sleep(0.1)
+        assert len(agents) == 1            # step did NOT drive a turn
+        # STT transcription is still consumed (text accumulates).
+        assert "a question" in " ".join(vloop._pending_text)
+    finally:
+        await vloop.stop()
+        await task
+
+
+@pytest.mark.asyncio
+async def test_speculative_start_begins_turn_below_full_threshold(monkeypatch):
+    """A prob in [speculative_threshold, smart_turn_threshold) starts the
+    agent speculatively on the transcript-so-far and marks telemetry."""
+    agents = install_agents(monkeypatch, [
+        say(GREETING_REPLY), speak_then_block("Speculative reply. ")])
+    stt, factory, transport = FakeSTT(), FakeTTSFactory(), FakeTransport()
+    vloop, detector, buffer = _smart_loop(
+        stt, factory, transport, monkeypatch, prob=0.0,
+        extra={"vad_stop_secs": 0.0, "speculative_threshold": 0.55,
+               "smart_turn_threshold": 0.9})
+    task = asyncio.create_task(vloop.run())
+    try:
+        await _await_greeting(vloop, agents)
+        stt.push_text("what time is it")
+        await asyncio.sleep(0.05)
+        for _ in range(3):
+            await vloop.on_inbound_audio(LOUD_CHUNK)
+        detector.set_prob(0.6)             # >= spec, < full
+        await vloop.on_inbound_audio(QUIET_CHUNK)
+        await _eventually(lambda: len(agents) == 2 and agents[1].run_kwargs,
+                          msg="speculative turn never started")
+        assert vloop._speculative_active is True
+        assert vloop._spec_started_count == 1
+        assert agents[1].run_kwargs["user_message"] == "what time is it"
+    finally:
+        await vloop.stop()
+        await task
+
+
+@pytest.mark.asyncio
+async def test_speculative_restart_on_transcript_tail(monkeypatch):
+    """If more speech (a transcript tail) arrives after a speculative start,
+    the speculative turn is interrupted and restarted with the fuller text."""
+    agents = install_agents(monkeypatch, [
+        say(GREETING_REPLY),
+        speak_then_block("Speculative partial answer. "),
+        say("Full answer to the complete question.")])
+    stt, factory, transport = FakeSTT(), FakeTTSFactory(), FakeTransport()
+    vloop, detector, buffer = _smart_loop(
+        stt, factory, transport, monkeypatch, prob=0.0,
+        extra={"vad_stop_secs": 0.0, "speculative_threshold": 0.55,
+               "smart_turn_threshold": 0.9, "min_interruption_words": 2})
+    task = asyncio.create_task(vloop.run())
+    try:
+        await _await_greeting(vloop, agents)
+        stt.push_text("what is the")
+        await asyncio.sleep(0.05)
+        for _ in range(3):
+            await vloop.on_inbound_audio(LOUD_CHUNK)
+        detector.set_prob(0.6)
+        await vloop.on_inbound_audio(QUIET_CHUNK)
+        await _eventually(lambda: vloop._speculative_active is True
+                          and len(agents) == 2,
+                          msg="speculative turn never started")
+        # The user kept talking: a transcript tail arrives.
+        stt.push_text("weather today please")
+        await _eventually(lambda: len(agents) == 3,
+                          msg="speculative turn never restarted")
+        assert vloop._spec_restarted_count == 1
+        assert agents[1].interrupt_event.is_set()   # speculative was killed
+        full = agents[2].run_kwargs["user_message"]
+        assert "what is the" in full and "weather today please" in full
+    finally:
+        await vloop.stop()
+        await task
+
+
+@pytest.mark.asyncio
+async def test_smart_barge_in_requires_words_and_duration(monkeypatch):
+    """During agent playback, energy alone must NOT barge in: it needs both
+    min_interruption_duration_ms of energy AND min_interruption_words from
+    the partial transcript. One loud chunk with no words = no barge."""
+    agents = install_agents(monkeypatch, [
+        say(GREETING_REPLY),
+        speak_then_block("A long reply the user will talk over. ")])
+    stt, factory, transport = FakeSTT(), FakeTTSFactory(), FakeTransport()
+    vloop, detector, buffer = _smart_loop(
+        stt, factory, transport, monkeypatch, prob=0.9,
+        extra={"vad_stop_secs": 0.0, "speculative_start": False,
+               "min_interruption_words": 2,
+               "min_interruption_duration_ms": 0})
+    task = asyncio.create_task(vloop.run())
+    try:
+        await _await_greeting(vloop, agents)
+        # Start the user turn so the agent is SPEAKING.
+        stt.push_text("first question")
+        await asyncio.sleep(0.05)
+        for _ in range(3):
+            await vloop.on_inbound_audio(LOUD_CHUNK)
+        await vloop.on_inbound_audio(QUIET_CHUNK)
+        await _eventually(lambda: vloop._state == turn_loop.SPEAKING
+                          and len(agents) == 2)
+        # Energy during playback but NO transcript words yet: no barge.
+        for _ in range(3):
+            await vloop.on_inbound_audio(LOUD_CHUNK)
+        await asyncio.sleep(0.05)
+        assert vloop._state == turn_loop.SPEAKING
+        assert not agents[1].interrupt_event.is_set()
+        # Now a partial transcript with >= min_interruption_words arrives:
+        stt.push_text("stop wait")
+        await asyncio.sleep(0.05)
+        await vloop.on_inbound_audio(LOUD_CHUNK)
+        await _eventually(lambda: vloop._state == turn_loop.LISTENING,
+                          msg="word+duration barge-in never fired")
+        assert agents[1].interrupt_event.is_set()
+    finally:
+        await vloop.stop()
+        await task
+
+
+@pytest.mark.asyncio
+async def test_allow_interruptions_false_disables_barge(monkeypatch):
+    """allow_interruptions=false: even energy + words must not barge in."""
+    agents = install_agents(monkeypatch, [
+        say(GREETING_REPLY),
+        speak_then_block("An uninterruptible reply. ")])
+    stt, factory, transport = FakeSTT(), FakeTTSFactory(), FakeTransport()
+    vloop, detector, buffer = _smart_loop(
+        stt, factory, transport, monkeypatch, prob=0.9,
+        extra={"vad_stop_secs": 0.0, "speculative_start": False,
+               "allow_interruptions": False,
+               "min_interruption_words": 1,
+               "min_interruption_duration_ms": 0})
+    task = asyncio.create_task(vloop.run())
+    try:
+        await _await_greeting(vloop, agents)
+        stt.push_text("a question")
+        await asyncio.sleep(0.05)
+        for _ in range(3):
+            await vloop.on_inbound_audio(LOUD_CHUNK)
+        await vloop.on_inbound_audio(QUIET_CHUNK)
+        await _eventually(lambda: vloop._state == turn_loop.SPEAKING
+                          and len(agents) == 2)
+        stt.push_text("interrupt me")
+        await asyncio.sleep(0.05)
+        for _ in range(5):
+            await vloop.on_inbound_audio(LOUD_CHUNK)
+        await asyncio.sleep(0.1)
+        assert vloop._state == turn_loop.SPEAKING
+        assert not agents[1].interrupt_event.is_set()
+    finally:
+        await vloop.stop()
+        await task
+
+
+@pytest.mark.asyncio
+async def test_smart_turn_feeds_rolling_buffer(monkeypatch):
+    """Inbound chunks feed the rolling 16kHz buffer in Smart Turn mode."""
+    agents = install_agents(monkeypatch, [say(GREETING_REPLY)])
+    stt, factory, transport = FakeSTT(), FakeTTSFactory(), FakeTransport()
+    vloop, detector, buffer = _smart_loop(
+        stt, factory, transport, monkeypatch, prob=0.0,
+        extra={"vad_stop_secs": 0.0})
+    task = asyncio.create_task(vloop.run())
+    try:
+        await _await_greeting(vloop, agents)
+        await vloop.on_inbound_audio(LOUD_CHUNK)
+        await vloop.on_inbound_audio(QUIET_CHUNK)
+        assert buffer.pushed >= 2
+    finally:
+        await vloop.stop()
+        await task

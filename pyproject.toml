@@ -159,6 +159,15 @@ voice-platform = [
   "daily-python>=0.19,<0.32",
   # websockets: Gradium streaming STT/TTS client sockets.
   "websockets>=15.0,<16",
+  # Local Smart Turn end-of-turn detection (ENG-555 — replaces Gradium
+  # semantic-VAD turn detection). onnxruntime runs the bundled
+  # smart-turn-v3 ONNX on CPU; transformers' WhisperFeatureExtractor builds
+  # the log-mel features (no torch needed — np feature path); scipy resamples
+  # inbound 24kHz audio to the model's 16kHz; numpy is the array substrate.
+  "onnxruntime>=1.24,<1.27",
+  "transformers>=4.48,<6",
+  "scipy>=1.11,<2",
+  "numpy>=1.26,<3",
 ]
 pty = [
   # Kept as a no-op back-compat alias — `ptyprocess` and `pywinpty` are now

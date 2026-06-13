@@ -77,16 +77,30 @@ class MarkedTransport(FakeTransport):
 
 
 def _make_loop(stt, factory, transport, extra=None, vamp=None):
+    # These vamp tests drive end-of-turn / barge-in via Gradium VAD step
+    # events, which ENG-555 kept behind turn_detector="gradium" as a fallback
+    # (Smart Turn is the new default and has its own tests in
+    # test_voice_turn_loop.py). The vamp triggers themselves (energy/vad) are
+    # detector-independent; pinning gradium keeps the step-driven turn flow
+    # these tests assert. A test can still override turn_detector via extra.
+    merged = {"turn_detector": "gradium"}
+    merged.update(extra or {})
     return turn_loop.VoiceTurnLoop(
-        stt, factory, transport, extra=extra or {}, vamp=vamp)
+        stt, factory, transport, extra=merged, vamp=vamp)
 
 
 def _telemetry_records(caplog):
     out = []
     for rec in caplog.records:
         msg = rec.getMessage()
-        if msg.startswith("voice/telemetry "):
-            out.append(json.loads(msg[len("voice/telemetry "):]))
+        if not msg.startswith("voice/telemetry "):
+            continue
+        payload = msg[len("voice/telemetry "):]
+        # The same prefix carries the (non-JSON) "sink unwritable" warning;
+        # only the structured records are JSON objects.
+        if not payload.lstrip().startswith("{"):
+            continue
+        out.append(json.loads(payload))
     return out
 
 
