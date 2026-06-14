@@ -11,12 +11,10 @@ description: >
 
   Standalone mode: this agent holds DAILY_API_KEY and creates its own private
   room + single-use meeting token at startup, then logs a shareable URL.
+  Orchestrated mode: an external control plane mints rooms and signals this
+  agent over an outbound SSE subscription; the agent never holds the Daily key.
 author: Supernal Technology
 requires_env:
-  - name: DAILY_API_KEY
-    description: "Daily API key (WebRTC transport — agent creates its own room)"
-    prompt: "Daily API key"
-    password: true
   - name: DEEPGRAM_API_KEY
     description: "Deepgram API key (Flux streaming STT + turn detection)"
     prompt: "Deepgram API key"
@@ -26,6 +24,18 @@ requires_env:
     prompt: "Cartesia API key"
     password: true
 optional_env:
+  - name: DAILY_API_KEY
+    description: "Daily API key (standalone mode — agent creates its own room)"
+    prompt: "Daily API key (or empty for orchestrated mode)"
+    password: true
+  - name: SECOND_BRAIN_URL
+    description: "Control-plane base URL (orchestrated mode)"
+    prompt: "Control plane URL (or empty)"
+    password: false
+  - name: SECOND_BRAIN_MCP_KEY
+    description: "Per-agent control-plane API key (orchestrated mode SSE auth)"
+    prompt: "Control plane API key (or empty)"
+    password: true
   - name: CARTESIA_VOICE_ID
     description: "Cartesia TTS voice id (or set platforms.voice.extra.cartesia_voice_id)"
     prompt: "Cartesia voice id (or empty for default)"

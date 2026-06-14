@@ -8,6 +8,11 @@ Standalone mode: this agent holds DAILY_API_KEY, creates its own private
 Daily room + a single-use meeting token at connect time, joins immediately,
 and logs the room URL for the owner to share. caller == owner.
 
+Orchestrated mode: an external control plane mints the room + token and signals
+this agent over an outbound SSE subscription (control_channel.py); the agent
+never holds the Daily key. This is the Second Brain fleet path, and is NOT part
+of the upstream PR — it lives only on this branch.
+
 Opinionated stack: Deepgram Flux (streaming STT + model-integrated turn
 detection), Cartesia (streaming TTS, default — the per-turn TTS is built
 behind a factory so another provider can be slotted in), and the agent's
@@ -33,6 +38,9 @@ logger = logging.getLogger(__name__)
 DAILY_API = "https://api.daily.co/v1"
 STANDALONE_ROOM_TTL_S = 3600
 
+DEFAULT_MODE = "standalone"
+VALID_MODES = {"standalone", "orchestrated"}
+
 # Call watchdog: an abandoned call — tab closed, or the room expired and
 # ejected the agent — would otherwise leave the billable STT stream running.
 # The watchdog tears the call down when humans are gone, the call ended
@@ -49,17 +57,20 @@ def _voice_modules():
     (hermes_plugins.platforms__voice)."""
     try:
         import cartesia_tts
+        import control_channel
         import daily_transport
         import deepgram_flux_stt
         import turn_loop
     except ImportError:
         from . import (
             cartesia_tts,
+            control_channel,
             daily_transport,
             deepgram_flux_stt,
             turn_loop,
         )
-    return (daily_transport, turn_loop, cartesia_tts, deepgram_flux_stt)
+    return (daily_transport, turn_loop, cartesia_tts, deepgram_flux_stt,
+            control_channel)
 
 
 def _daily_available() -> bool:
@@ -79,13 +90,14 @@ def _websockets_available() -> bool:
 
 
 def check_requirements() -> bool:
-    """Deps importable + the three call keys present (cheap env read, no
-    config load): Daily (transport), Deepgram (Flux STT), Cartesia (TTS)."""
+    """Deps importable + the always-needed agent keys present (cheap env read,
+    no config load): Deepgram (Flux STT) and Cartesia (TTS). The transport key
+    is mode-specific — DAILY_API_KEY for standalone, the control-plane keys for
+    orchestrated — and is checked in validate_config()."""
     if not _daily_available() or not _websockets_available():
         return False
     return bool(
-        os.getenv("DAILY_API_KEY", "").strip()
-        and os.getenv("DEEPGRAM_API_KEY", "").strip()
+        os.getenv("DEEPGRAM_API_KEY", "").strip()
         and os.getenv("CARTESIA_API_KEY", "").strip()
     )
 
@@ -115,8 +127,20 @@ def _resolve_opt_float_extra(extra: Dict[str, Any], key: str) -> Optional[float]
         return None
 
 
+def _resolve_mode(extra: Dict[str, Any]) -> str:
+    mode = (extra.get("mode") or os.getenv("VOICE_MODE") or DEFAULT_MODE).strip()
+    return mode if mode in VALID_MODES else DEFAULT_MODE
+
+
 def validate_config(config) -> bool:
-    return bool(os.getenv("DAILY_API_KEY", "").strip())
+    extra = getattr(config, "extra", {}) or {}
+    if _resolve_mode(extra) == "standalone":
+        return bool(os.getenv("DAILY_API_KEY", "").strip())
+    # orchestrated: the control plane mints rooms; the agent needs to reach it.
+    return bool(
+        os.getenv("SECOND_BRAIN_URL", "").strip()
+        and os.getenv("SECOND_BRAIN_MCP_KEY", "").strip()
+    )
 
 
 def is_connected(config) -> bool:
@@ -132,7 +156,7 @@ def register(ctx) -> None:
         check_fn=check_requirements,
         validate_config=validate_config,
         is_connected=is_connected,
-        required_env=["DAILY_API_KEY", "DEEPGRAM_API_KEY", "CARTESIA_API_KEY"],
+        required_env=["DEEPGRAM_API_KEY", "CARTESIA_API_KEY"],
         install_hint='uv sync --extra voice-platform   # daily-python + websockets',
         pii_safe=True,
         emoji="📞",
@@ -148,11 +172,15 @@ def register(ctx) -> None:
 
 
 class VoiceAdapter(BasePlatformAdapter):
-    """Daily-room voice call adapter (standalone mode).
+    """Daily-room voice call adapter.
 
-    This agent holds DAILY_API_KEY, creates its own private room + meeting
+    Standalone mode: holds DAILY_API_KEY, creates its own private room + meeting
     token via the Daily REST API at connect time, joins immediately, and logs
     the room URL for the owner to share.
+
+    Orchestrated mode: subscribes to the control plane over outbound SSE; a
+    join_room event joins the room the control plane minted, leave_room tears
+    the call down. The agent never holds the Daily key.
 
     One active call at a time (daily-python virtual devices are process-level
     singletons — see daily_transport.py).
@@ -161,10 +189,23 @@ class VoiceAdapter(BasePlatformAdapter):
     def __init__(self, config: PlatformConfig):
         platform = Platform("voice")
         super().__init__(config=config, platform=platform)
+        self._mode = _resolve_mode(config.extra or {})
+        self._control = None
         self._call_lock = asyncio.Lock()
         self._active_call: Optional[Dict[str, Any]] = None
 
     async def connect(self) -> bool:
+        if self._mode == "orchestrated":
+            (*_, control_channel) = _voice_modules()
+            self._control = control_channel.ControlChannel(
+                os.environ["SECOND_BRAIN_URL"],
+                os.environ["SECOND_BRAIN_MCP_KEY"],
+                self._handle_control_event,
+            )
+            self._control.start()
+            self._mark_connected()
+            logger.info("voice: orchestrated mode — awaiting call commands")
+            return True
         # Standalone: create our own private room + tokens, join immediately.
         # The room is private, so the shareable URL must carry an owner token —
         # the bare room URL alone cannot join a private room.
@@ -180,8 +221,15 @@ class VoiceAdapter(BasePlatformAdapter):
             "agent (keep the token private):\n    %s", share_url)
         return True
 
+    async def _handle_control_event(self, event: Dict[str, Any]) -> None:
+        action = event.get("action")
+        if action == "join_room":
+            await self._start_call(event["roomUrl"], event["token"])
+        elif action == "leave_room":
+            await self._end_call("control-leave")
+
     async def _start_call(self, room_url: str, token: str) -> None:
-        daily_transport, turn_loop, cartesia_tts, deepgram_flux_stt = _voice_modules()
+        daily_transport, turn_loop, cartesia_tts, deepgram_flux_stt, _ = _voice_modules()
         async with self._call_lock:
             if self._active_call is not None:
                 await self._end_call_locked("replaced-by-new-call")
@@ -348,7 +396,7 @@ class VoiceAdapter(BasePlatformAdapter):
         }
         # Durable + WARNING-level emit: this is the per-call cost record; it
         # must survive log levels/rotation on the agent volume.
-        (_, turn_loop, _, _) = _voice_modules()
+        (_, turn_loop, _, _, _) = _voice_modules()
         turn_loop.emit_telemetry(summary)
         logger.info("voice: call ended reason=%s", reason)
 
@@ -385,6 +433,9 @@ class VoiceAdapter(BasePlatformAdapter):
         return room["url"], agent_token, share_url
 
     async def disconnect(self) -> None:
+        if self._control is not None:
+            await self._control.stop()
+            self._control = None
         await self._end_call("adapter-disconnect")
 
     async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
