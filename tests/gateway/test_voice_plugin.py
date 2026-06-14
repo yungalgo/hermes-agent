@@ -114,8 +114,7 @@ def test_register_registers_voice_platform():
     kwargs = ctx.register_platform.call_args.kwargs
     assert kwargs["name"] == "voice"
     assert kwargs["label"] == "Voice"
-    assert kwargs["required_env"] == [
-        "DAILY_API_KEY", "DEEPGRAM_API_KEY", "CARTESIA_API_KEY"]
+    assert kwargs["required_env"] == ["DEEPGRAM_API_KEY", "CARTESIA_API_KEY"]
     assert kwargs["pii_safe"] is True
     assert kwargs["allow_update_command"] is False
     for fn in ("check_fn", "validate_config", "is_connected", "adapter_factory"):
@@ -130,10 +129,12 @@ def test_adapter_factory_returns_voice_adapter():
     assert isinstance(adapter, _adapter.VoiceAdapter)
 
 
-def test_check_requirements_needs_all_three_keys(monkeypatch):
+def test_check_requirements_needs_stt_and_tts_keys(monkeypatch):
+    # The transport key is mode-specific (checked in validate_config), so
+    # check_requirements gates on Deepgram + Cartesia only — not DAILY_API_KEY.
     monkeypatch.setattr(_adapter, "_daily_available", lambda: True)
     monkeypatch.setattr(_adapter, "_websockets_available", lambda: True)
-    monkeypatch.setenv("DAILY_API_KEY", "dk")
+    monkeypatch.delenv("DAILY_API_KEY", raising=False)
     monkeypatch.setenv("DEEPGRAM_API_KEY", "dg")
     monkeypatch.delenv("CARTESIA_API_KEY", raising=False)
     assert _adapter.check_requirements() is False
@@ -150,12 +151,32 @@ def test_check_requirements_false_without_deps(monkeypatch):
     assert _adapter.check_requirements() is False
 
 
-def test_validate_config_requires_daily_key(monkeypatch):
-    cfg = PlatformConfig(enabled=True, extra={})
+def test_validate_config_standalone_requires_daily_key(monkeypatch):
+    cfg = PlatformConfig(enabled=True, extra={})   # default mode = standalone
     monkeypatch.delenv("DAILY_API_KEY", raising=False)
     assert _adapter.validate_config(cfg) is False
     monkeypatch.setenv("DAILY_API_KEY", "dk")
     assert _adapter.validate_config(cfg) is True
+
+
+def test_validate_config_orchestrated_needs_control_plane(monkeypatch):
+    cfg = PlatformConfig(enabled=True, extra={"mode": "orchestrated"})
+    monkeypatch.delenv("DAILY_API_KEY", raising=False)
+    monkeypatch.delenv("SECOND_BRAIN_URL", raising=False)
+    monkeypatch.delenv("SECOND_BRAIN_MCP_KEY", raising=False)
+    assert _adapter.validate_config(cfg) is False
+    monkeypatch.setenv("SECOND_BRAIN_URL", "https://cp")
+    monkeypatch.setenv("SECOND_BRAIN_MCP_KEY", "k")
+    assert _adapter.validate_config(cfg) is True   # control-plane keys, no DAILY
+
+
+def test_resolve_mode(monkeypatch):
+    monkeypatch.delenv("VOICE_MODE", raising=False)
+    assert _adapter._resolve_mode({}) == "standalone"
+    assert _adapter._resolve_mode({"mode": "orchestrated"}) == "orchestrated"
+    assert _adapter._resolve_mode({"mode": "bogus"}) == "standalone"
+    monkeypatch.setenv("VOICE_MODE", "orchestrated")
+    assert _adapter._resolve_mode({}) == "orchestrated"
 
 
 # --------------------------------------------------------------------------- #
