@@ -64,6 +64,13 @@ cd /opt/data
 # shellcheck disable=SC1091
 . /opt/hermes/.venv/bin/activate
 
+# Note: plugin/runtime keys read via os.getenv (the voice platform's
+# DEEPGRAM_API_KEY / CARTESIA_API_KEY and the control-plane SECOND_BRAIN_URL /
+# SECOND_BRAIN_MCP_KEY) are delivered as CONTAINER env vars — Fly secrets or
+# docker -e — and reach this process via with-contenv (the shebang), the same
+# path the dashboard service uses for HERMES_DASHBOARD. The volume .env is for
+# Hermes's own config only; it is intentionally NOT sourced here.
+
 # Restore the original working directory before handing off to
 # the user's command so `hermes chat` starts in the Docker -w
 # directory, not /opt/data.
