@@ -1,0 +1,9 @@
+# Build-only config so `fly deploy --build-only --push` can build the
+# voice-orchestration fork image (amd64) on Fly's remote builder and push it to
+# registry.fly.io/supernal-hermes-voice. Not a deployed app — agents are
+# provisioned per-user by Second Brain.
+app = "supernal-hermes-voice"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
