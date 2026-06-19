@@ -340,5 +340,12 @@ VOLUME [ "/opt/data" ]
 # and exec's the final program so its exit code becomes the container
 # exit code. Without the wrapper-as-ENTRYPOINT, leading-dash args
 # like `--version` would be intercepted by /init's POSIX shell.
-ENTRYPOINT [ "/init", "/opt/hermes/docker/main-wrapper.sh" ]
+#
+# boot.sh dispatches: on Fly Machines (FLY_MACHINE_ID set) Fly's init is PID 1,
+# so s6-overlay cannot run — boot.sh runs the gateway directly via
+# fly-entrypoint.sh. Everywhere else it forwards to the s6 tree unchanged
+# (`exec /init /opt/hermes/docker/main-wrapper.sh "$@"`), preserving the
+# docker run contract above.
+RUN chmod +x /opt/hermes/docker/boot.sh /opt/hermes/docker/fly-entrypoint.sh
+ENTRYPOINT [ "/opt/hermes/docker/boot.sh" ]
 CMD [ ]
