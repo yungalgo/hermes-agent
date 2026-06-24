@@ -60,11 +60,12 @@ cartesia = _load_voice_module("cartesia_tts")
 # Fakes
 # --------------------------------------------------------------------------- #
 
+
 class _FakeFluxSTT:
     """Yields a fixed list of normalized Flux events, then ends (so the
     turn loop's `async for` over events() returns)."""
 
-    provider = "deepgram_flux"   # the STT port surface the turn loop tags
+    provider = "deepgram_flux"  # the STT port surface the turn loop tags
 
     def __init__(self, events):
         self._events = events
@@ -79,18 +80,37 @@ class _FakeTransport:
         self._playing = playing
         self.cleared = 0
         self.first_write_t = None
+        self.queued_chunks_since_mark = 0
+        self.cleared_chunks_since_mark = 0
+        self.last_clear_count = 0
+        self.queue_depth = 0
+        self.first_write_callback = None
 
     def is_playing(self) -> bool:
         return self._playing
 
-    def clear_output(self) -> None:
+    def clear_output(self) -> int:
         self.cleared += 1
+        self.last_clear_count = self.queue_depth
+        self.cleared_chunks_since_mark += self.queue_depth
+        self.queue_depth = 0
+        self._playing = False
+        return self.last_clear_count
 
     def reset_write_mark(self) -> None:
-        pass
+        self.first_write_t = None
+        self.queued_chunks_since_mark = 0
+        self.cleared_chunks_since_mark = 0
+        self.last_clear_count = 0
 
-    async def send_audio(self, pcm: bytes) -> None:
-        pass
+    def set_first_write_callback(self, callback) -> None:
+        self.first_write_callback = callback
+
+    async def send_audio(self, pcm: bytes) -> int:
+        self.queued_chunks_since_mark += 1
+        self.queue_depth += 1
+        self._playing = True
+        return 1
 
 
 async def _noop_tts_factory(on_audio):  # never called: _start_turn is patched
@@ -99,13 +119,17 @@ async def _noop_tts_factory(on_audio):  # never called: _start_turn is patched
 
 def _make_loop(events, *, playing=False, extra=None):
     return turn_loop.VoiceTurnLoop(
-        _FakeFluxSTT(events), _noop_tts_factory, _FakeTransport(playing=playing),
-        extra=extra or {})
+        _FakeFluxSTT(events),
+        _noop_tts_factory,
+        _FakeTransport(playing=playing),
+        extra=extra or {},
+    )
 
 
 # --------------------------------------------------------------------------- #
 # Plugin registration + requirements
 # --------------------------------------------------------------------------- #
+
 
 def test_register_registers_voice_platform():
     ctx = MagicMock()
@@ -152,7 +176,7 @@ def test_check_requirements_false_without_deps(monkeypatch):
 
 
 def test_validate_config_standalone_requires_daily_key(monkeypatch):
-    cfg = PlatformConfig(enabled=True, extra={})   # default mode = standalone
+    cfg = PlatformConfig(enabled=True, extra={})  # default mode = standalone
     monkeypatch.delenv("DAILY_API_KEY", raising=False)
     assert _adapter.validate_config(cfg) is False
     monkeypatch.setenv("DAILY_API_KEY", "dk")
@@ -167,7 +191,7 @@ def test_validate_config_orchestrated_needs_control_plane(monkeypatch):
     assert _adapter.validate_config(cfg) is False
     monkeypatch.setenv("SECOND_BRAIN_URL", "https://cp")
     monkeypatch.setenv("SECOND_BRAIN_MCP_KEY", "k")
-    assert _adapter.validate_config(cfg) is True   # control-plane keys, no DAILY
+    assert _adapter.validate_config(cfg) is True  # control-plane keys, no DAILY
 
 
 def test_resolve_mode(monkeypatch):
@@ -183,11 +207,18 @@ def test_resolve_mode(monkeypatch):
 # Extra-config parsers
 # --------------------------------------------------------------------------- #
 
+
 def test_resolve_float_extra_default_and_parse():
     assert _adapter._resolve_float_extra({}, "eot_threshold", 0.7) == 0.7
-    assert _adapter._resolve_float_extra({"eot_threshold": "0.5"}, "eot_threshold", 0.7) == 0.5
+    assert (
+        _adapter._resolve_float_extra({"eot_threshold": "0.5"}, "eot_threshold", 0.7)
+        == 0.5
+    )
     # garbage falls back to the default, never raises
-    assert _adapter._resolve_float_extra({"eot_threshold": "nope"}, "eot_threshold", 0.7) == 0.7
+    assert (
+        _adapter._resolve_float_extra({"eot_threshold": "nope"}, "eot_threshold", 0.7)
+        == 0.7
+    )
 
 
 def test_resolve_opt_float_extra_returns_none_when_unset():
@@ -200,6 +231,7 @@ def test_resolve_opt_float_extra_returns_none_when_unset():
 # Flux event -> turn / barge-in logic (the moat)
 # --------------------------------------------------------------------------- #
 
+
 @pytest.mark.asyncio
 async def test_eager_then_end_starts_a_single_turn(monkeypatch):
     loop = _make_loop([
@@ -207,8 +239,7 @@ async def test_eager_then_end_starts_a_single_turn(monkeypatch):
         {"event": "end_of_turn", "transcript": "hello there"},
     ])
     started = []
-    monkeypatch.setattr(loop, "_start_turn",
-                        lambda text, **k: started.append(text))
+    monkeypatch.setattr(loop, "_start_turn", lambda text, **k: started.append(text))
     await loop._consume_flux()
     # Eager starts the turn; the matching end_of_turn lets it stand (no restart).
     assert started == ["hello there"]
@@ -220,8 +251,7 @@ async def test_end_of_turn_without_eager_starts_turn(monkeypatch):
         {"event": "end_of_turn", "transcript": "what time is it"},
     ])
     started = []
-    monkeypatch.setattr(loop, "_start_turn",
-                        lambda text, **k: started.append(text))
+    monkeypatch.setattr(loop, "_start_turn", lambda text, **k: started.append(text))
     await loop._consume_flux()
     assert started == ["what time is it"]
 
@@ -231,8 +261,7 @@ async def test_start_of_turn_barges_in_while_audio_playing(monkeypatch):
     # State is LISTENING but the transport is still playing the agent's tail —
     # barge-in must fire on that tail, which is the bug the is_playing() check
     # fixes.
-    loop = _make_loop(
-        [{"event": "start_of_turn", "transcript": "wait"}], playing=True)
+    loop = _make_loop([{"event": "start_of_turn", "transcript": "wait"}], playing=True)
     barged = []
 
     async def _fake_barge():
@@ -245,8 +274,7 @@ async def test_start_of_turn_barges_in_while_audio_playing(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_start_of_turn_idle_does_not_barge(monkeypatch):
-    loop = _make_loop(
-        [{"event": "start_of_turn", "transcript": "hi"}], playing=False)
+    loop = _make_loop([{"event": "start_of_turn", "transcript": "hi"}], playing=False)
     barged = []
 
     async def _fake_barge():
@@ -254,14 +282,16 @@ async def test_start_of_turn_idle_does_not_barge(monkeypatch):
 
     monkeypatch.setattr(loop, "_barge_in", _fake_barge)
     await loop._consume_flux()
-    assert barged == []   # nothing playing -> pre-warm, not barge
+    assert barged == []  # nothing playing -> pre-warm, not barge
 
 
 @pytest.mark.asyncio
 async def test_start_of_turn_respects_allow_interruptions_false(monkeypatch):
     loop = _make_loop(
         [{"event": "start_of_turn", "transcript": "wait"}],
-        playing=True, extra={"allow_interruptions": False})
+        playing=True,
+        extra={"allow_interruptions": False},
+    )
     barged = []
 
     async def _fake_barge():
@@ -286,7 +316,7 @@ async def test_turn_resumed_cancels_the_speculative_turn(monkeypatch):
 
     monkeypatch.setattr(loop, "_barge_in", _fake_barge)
     await loop._consume_flux()
-    assert barged == [True]   # the user kept talking -> kill the eager turn
+    assert barged == [True]  # the user kept talking -> kill the eager turn
 
 
 def test_resolve_bool_extra():
@@ -296,12 +326,176 @@ def test_resolve_bool_extra():
     assert turn_loop._resolve_bool_extra({"k": False}, "k", True) is False
 
 
+def test_turn_telemetry_marks_delivery_failure_and_unhealthy(monkeypatch):
+    records = []
+    monkeypatch.setattr(turn_loop, "emit_telemetry", records.append)
+    transport = _FakeTransport()
+    loop = turn_loop.VoiceTurnLoop(
+        _FakeFluxSTT([]),
+        _noop_tts_factory,
+        transport,
+        extra={},
+        call_session_id="call_123",
+    )
+    loop._turn_seq = 7
+    loop._tel = {
+        "opened_at": 100.0,
+        "speech_end": 100.0,
+        "vad_end": 100.0,
+        "agent_start": 100.1,
+        "first_delta": 100.15,
+        "first_sentence": 100.16,
+        "tts_first_audio": 100.2,
+        "turn_detector": "deepgram_flux",
+        "eot_reason": "endpoint",
+    }
+    transport.queued_chunks_since_mark = 3
+    transport.cleared_chunks_since_mark = 3
+    transport.last_clear_count = 3
+
+    loop._tel_emit("ok")
+
+    turn_record = records[0]
+    assert turn_record["event"] == "voice_turn"
+    assert turn_record["callSessionId"] == "call_123"
+    assert turn_record["audio_delivery_status"] == (turn_loop.DELIVERY_FAILED)
+    assert turn_record["audio_queue"]["chunks_enqueued"] == 3
+    failure = records[1]
+    assert failure["event"] == turn_loop.DELIVERY_FAILED
+    assert failure["turn"] == 7
+    assert loop.unhealthy_reason == turn_loop.DELIVERY_FAILED
+
+
+def test_interrupted_before_playback_is_not_unhealthy(monkeypatch):
+    records = []
+    monkeypatch.setattr(turn_loop, "emit_telemetry", records.append)
+    loop = turn_loop.VoiceTurnLoop(
+        _FakeFluxSTT([]), _noop_tts_factory, _FakeTransport(), extra={}
+    )
+    loop._turn_seq = 2
+    loop._tel = {
+        "opened_at": 100.0,
+        "speech_end": 100.0,
+        "vad_end": 100.0,
+        "tts_first_audio": 100.2,
+    }
+
+    loop._tel_emit("interrupted")
+
+    assert records[0]["audio_delivery_status"] == (
+        turn_loop.INTERRUPTED_BEFORE_PLAYBACK
+    )
+    assert records[1]["event"] == turn_loop.INTERRUPTED_BEFORE_PLAYBACK
+    assert loop.unhealthy_reason is None
+
+
+@pytest.mark.asyncio
+async def test_control_event_passes_call_session_id(monkeypatch):
+    adapter = _adapter.VoiceAdapter(
+        PlatformConfig(enabled=True, extra={"mode": "orchestrated"})
+    )
+    calls = []
+
+    async def _fake_start(room_url, token, *, call_session_id=None, recovery_count=0):
+        calls.append((room_url, token, call_session_id, recovery_count))
+
+    monkeypatch.setattr(adapter, "_start_call", _fake_start)
+    await adapter._handle_control_event({
+        "action": "join_room",
+        "roomUrl": "https://daily.example/room",
+        "token": "daily-token",
+        "callSessionId": "call_456",
+    })
+
+    assert calls == [("https://daily.example/room", "daily-token", "call_456", 0)]
+
+
+@pytest.mark.asyncio
+async def test_recover_call_restarts_same_room_once(monkeypatch):
+    adapter = _adapter.VoiceAdapter(
+        PlatformConfig(enabled=True, extra={"mode": "orchestrated"})
+    )
+    records = []
+    ended = []
+    started = []
+    adapter._active_call = {
+        "room_url": "https://daily.example/room",
+        "token": "daily-token",
+        "call_session_id": "call_789",
+        "recovery_count": 0,
+    }
+    monkeypatch.setattr(adapter, "_emit_voice_telemetry", records.append)
+
+    async def _fake_end(reason):
+        ended.append(reason)
+        adapter._active_call = None
+
+    async def _fake_start(room_url, token, *, call_session_id=None, recovery_count=0):
+        started.append((room_url, token, call_session_id, recovery_count))
+        adapter._active_call = {
+            "room_url": room_url,
+            "token": token,
+            "call_session_id": call_session_id,
+            "recovery_count": recovery_count,
+        }
+
+    monkeypatch.setattr(adapter, "_end_call_locked", _fake_end)
+    monkeypatch.setattr(adapter, "_start_call_locked", _fake_start)
+
+    await adapter._recover_call(turn_loop.DELIVERY_FAILED)
+
+    assert ended == [f"recovering:{turn_loop.DELIVERY_FAILED}"]
+    assert started == [("https://daily.example/room", "daily-token", "call_789", 1)]
+    assert [r["event"] for r in records] == [
+        "voice_recovery_attempted",
+        "voice_recovery_succeeded",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_recover_call_is_bounded(monkeypatch):
+    adapter = _adapter.VoiceAdapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "mode": "orchestrated",
+                "max_recovery_attempts": 1,
+            },
+        )
+    )
+    records = []
+    ended = []
+    adapter._active_call = {
+        "room_url": "https://daily.example/room",
+        "token": "daily-token",
+        "call_session_id": "call_789",
+        "recovery_count": 1,
+    }
+    monkeypatch.setattr(adapter, "_emit_voice_telemetry", records.append)
+
+    async def _fake_end(reason):
+        ended.append(reason)
+        adapter._active_call = None
+
+    async def _fail_start(*_args, **_kwargs):
+        raise AssertionError("bounded recovery must not restart")
+
+    monkeypatch.setattr(adapter, "_end_call_locked", _fake_end)
+    monkeypatch.setattr(adapter, "_start_call_locked", _fail_start)
+
+    await adapter._recover_call(turn_loop.DELIVERY_FAILED)
+
+    assert records[0]["event"] == "voice_recovery_skipped"
+    assert ended == [f"unhealthy:{turn_loop.DELIVERY_FAILED}"]
+
+
 # --------------------------------------------------------------------------- #
 # Flux 24k -> 16k resampler (pure function)
 # --------------------------------------------------------------------------- #
 
+
 def test_resample_to_16k_reduces_sample_count():
-    pcm = bytes(2400 * 2)   # 2400 s16le samples @ 24k (silence)
+    pcm = bytes(2400 * 2)  # 2400 s16le samples @ 24k (silence)
     out = flux._resample_to_16k(pcm, 24000)
     # 24k -> 16k is a 2/3 ratio: 2400 -> 1600 samples (3200 bytes).
     assert len(out) == 1600 * 2
@@ -309,7 +503,8 @@ def test_resample_to_16k_reduces_sample_count():
 
 def test_resample_to_16k_interpolates_a_ramp():
     import array
-    src = array.array("h", [0, 300, 600, 900])   # 4 samples
+
+    src = array.array("h", [0, 300, 600, 900])  # 4 samples
     out = array.array("h")
     out.frombytes(flux._resample_to_16k(src.tobytes(), 24000))
     # 4 -> round(4*2/3)=3 samples, endpoints preserved, middle interpolated.
@@ -331,36 +526,42 @@ def test_resample_to_16k_empty():
 # Flux wire-message normalization (the event contract the turn loop consumes)
 # --------------------------------------------------------------------------- #
 
+
 def test_flux_normalize_start_of_turn():
-    out = flux._normalize_flux_message(
-        {"type": "TurnInfo", "event": "StartOfTurn", "transcript": "hi",
-         "end_of_turn_confidence": 0.2})
+    out = flux._normalize_flux_message({
+        "type": "TurnInfo",
+        "event": "StartOfTurn",
+        "transcript": "hi",
+        "end_of_turn_confidence": 0.2,
+    })
     assert out["event"] == "start_of_turn"
     assert out["transcript"] == "hi"
     assert out["confidence"] == 0.2
 
 
 def test_flux_normalize_eager_and_end_events():
-    eager = flux._normalize_flux_message(
-        {"type": "TurnInfo", "event": "EagerEndOfTurn"})
-    end = flux._normalize_flux_message(
-        {"type": "TurnInfo", "event": "EndOfTurn"})
-    resumed = flux._normalize_flux_message(
-        {"type": "TurnInfo", "event": "TurnResumed"})
+    eager = flux._normalize_flux_message({
+        "type": "TurnInfo",
+        "event": "EagerEndOfTurn",
+    })
+    end = flux._normalize_flux_message({"type": "TurnInfo", "event": "EndOfTurn"})
+    resumed = flux._normalize_flux_message({"type": "TurnInfo", "event": "TurnResumed"})
     assert eager["event"] == "eager_end_of_turn"
     assert end["event"] == "end_of_turn"
     assert resumed["event"] == "turn_resumed"
 
 
 def test_flux_normalize_missing_transcript_becomes_empty():
-    out = flux._normalize_flux_message(
-        {"type": "TurnInfo", "event": "StartOfTurn", "transcript": None})
+    out = flux._normalize_flux_message({
+        "type": "TurnInfo",
+        "event": "StartOfTurn",
+        "transcript": None,
+    })
     assert out["transcript"] == ""
 
 
 def test_flux_normalize_drops_unknown_and_non_turninfo():
-    assert flux._normalize_flux_message(
-        {"type": "TurnInfo", "event": "Bogus"}) is None
+    assert flux._normalize_flux_message({"type": "TurnInfo", "event": "Bogus"}) is None
     assert flux._normalize_flux_message({"type": "Metadata"}) is None
     assert flux._normalize_flux_message({"type": "Connected"}) is None
 
@@ -369,6 +570,7 @@ def test_flux_normalize_drops_unknown_and_non_turninfo():
 # Daily transport queue logic (the barge-in audio path — no SDK needed)
 # --------------------------------------------------------------------------- #
 
+
 async def _noop_audio_in(pcm: bytes) -> None:
     pass
 
@@ -376,39 +578,47 @@ async def _noop_audio_in(pcm: bytes) -> None:
 @pytest.mark.asyncio
 async def test_transport_send_audio_splits_large_pcm():
     import asyncio
+
     t = daily_transport.DailyTransport(asyncio.get_running_loop(), _noop_audio_in)
     big = bytes(daily_transport.OUT_CHUNK_BYTES * 3 + 100)
-    await t.send_audio(big)
+    assert await t.send_audio(big) == 4
     sizes = []
     while not t._out_q.empty():
         sizes.append(len(t._out_q.get_nowait()))
     assert len(sizes) == 4  # 3 full chunks + a 100-byte remainder
     assert all(s <= daily_transport.OUT_CHUNK_BYTES for s in sizes)
     assert sum(sizes) == len(big)
+    assert t.queued_chunks_since_mark == 4
 
 
 @pytest.mark.asyncio
 async def test_transport_send_audio_small_stays_one_chunk():
     import asyncio
+
     t = daily_transport.DailyTransport(asyncio.get_running_loop(), _noop_audio_in)
-    await t.send_audio(b"\x00" * 200)
+    assert await t.send_audio(b"\x00" * 200) == 1
     assert t._out_q.qsize() == 1
+    assert t.queued_chunks_since_mark == 1
 
 
 @pytest.mark.asyncio
 async def test_transport_is_playing_and_clear_output():
     import asyncio
+
     t = daily_transport.DailyTransport(asyncio.get_running_loop(), _noop_audio_in)
     assert t.is_playing() is False
     await t.send_audio(b"\x00" * 200)
     assert t.is_playing() is True
-    t.clear_output()                      # barge-in drops queued audio
+    assert t.clear_output() == 1  # barge-in drops queued audio
     assert t.is_playing() is False
+    assert t.cleared_chunks_since_mark == 1
+    assert t.last_clear_count == 1
 
 
 # --------------------------------------------------------------------------- #
 # Cartesia request builder (pure) + the <flush> mapping
 # --------------------------------------------------------------------------- #
+
 
 def test_cartesia_request_basic_payload():
     c = cartesia.CartesiaTTSClient("k", "voice-1")
@@ -446,6 +656,7 @@ def test_cartesia_requires_a_voice_id():
 # Cartesia Ink-2 wire-message normalization (the A/B adapter's event contract)
 # --------------------------------------------------------------------------- #
 
+
 def test_ink_normalize_maps_every_turn_event():
     # The whole point of the seam: Ink-2's turn.* events normalize onto the
     # SAME EV_* contract Flux produces, so the turn loop drives both identically.
@@ -471,8 +682,12 @@ def test_ink_normalize_resume_is_turn_resumed():
 
 def test_ink_normalize_transcript_field():
     # Verified live: the transcript lives in "transcript".
-    assert ink._normalize_ink_message(
-        {"type": "turn.end", "transcript": "hi there"})["transcript"] == "hi there"
+    assert (
+        ink._normalize_ink_message({"type": "turn.end", "transcript": "hi there"})[
+            "transcript"
+        ]
+        == "hi there"
+    )
 
 
 def test_ink_normalize_defaults_missing_fields():
@@ -487,7 +702,10 @@ def test_ink_normalize_carries_turn_id():
     # Verified live: id field is "turn_id" (string); Ink-2 sends no confidence
     # or per-word list, so those stay None/[] for shape-parity with Flux.
     out = ink._normalize_ink_message({
-        "type": "turn.update", "transcript": "partial", "turn_id": "3"})
+        "type": "turn.update",
+        "transcript": "partial",
+        "turn_id": "3",
+    })
     assert out["transcript"] == "partial"
     assert out["turn_index"] == "3"
     assert out["confidence"] is None
@@ -508,6 +726,7 @@ def test_ink_requires_api_key():
 # --------------------------------------------------------------------------- #
 # STT port surface + factory (both providers behind one seam)
 # --------------------------------------------------------------------------- #
+
 
 def test_both_providers_expose_provider_tag():
     dg = flux.DeepgramFluxSTT("dg-key")
@@ -551,8 +770,10 @@ def test_make_stt_builds_cartesia_ink(monkeypatch):
 def test_make_stt_passes_flux_thresholds(monkeypatch):
     monkeypatch.setenv("DEEPGRAM_API_KEY", "dg")
     stt = stt_port.make_stt(
-        "deepgram_flux", input_rate=24000,
-        extra={"eot_threshold": "0.8", "eager_eot_threshold": "0.4"})
+        "deepgram_flux",
+        input_rate=24000,
+        extra={"eot_threshold": "0.8", "eager_eot_threshold": "0.4"},
+    )
     assert stt._eot_threshold == 0.8
     assert stt._eager_eot_threshold == 0.4
 

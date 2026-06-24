@@ -69,6 +69,8 @@ DEFAULT_GREETING_PROMPT = (
     "one short, warm sentence and ask how you can help.)"
 )
 DEFAULT_FILLER_TEXT = "One moment."
+DELIVERY_FAILED = "assistant_audio_delivery_failed"
+INTERRUPTED_BEFORE_PLAYBACK = "turn_interrupted_before_playback"
 
 LISTENING, THINKING, SPEAKING = "listening", "thinking", "speaking"
 
@@ -99,7 +101,10 @@ def emit_telemetry(record: Dict[str, Any]) -> None:
             _sink_warned = True
             logger.warning(
                 "voice/telemetry sink unwritable (%s): %s — records stay "
-                "in the process logs only", TELEMETRY_SINK_PATH, exc)
+                "in the process logs only",
+                TELEMETRY_SINK_PATH,
+                exc,
+            )
 
 
 def _voice_model_name() -> Optional[str]:
@@ -107,6 +112,7 @@ def _voice_model_name() -> Optional[str]:
     None means voice turns ran on the main model."""
     try:
         from gateway.run import _voice_model_name as _core_voice_model_name
+
         return _core_voice_model_name()
     except Exception:
         return None
@@ -202,18 +208,29 @@ def _create_voice_agent(
         stream_delta_callback=stream_delta_callback,
         tool_progress_callback=tool_progress_callback,
         fallback_model=GatewayRunner._load_fallback_model(),
-        reasoning_config=(_resolve_reasoning_override(extra or {})
-                          or GatewayRunner._load_reasoning_config()),
+        reasoning_config=(
+            _resolve_reasoning_override(extra or {})
+            or GatewayRunner._load_reasoning_config()
+        ),
     )
 
 
 class VoiceTurnLoop:
-    def __init__(self, stt, tts_factory, transport, *, extra: Dict[str, Any]):
+    def __init__(
+        self,
+        stt,
+        tts_factory,
+        transport,
+        *,
+        extra: Dict[str, Any],
+        call_session_id: Optional[str] = None,
+    ):
         """tts_factory(on_audio) -> opened TTS turn (one per turn)."""
         self._stt = stt
         self._tts_factory = tts_factory
         self._transport = transport
         self._extra = extra or {}
+        self._call_session_id = call_session_id
         self._greeting = self._extra.get("greeting_prompt") or DEFAULT_GREETING_PROMPT
         self._filler = self._extra.get("filler_text") or DEFAULT_FILLER_TEXT
         self._session_id = f"voice-{uuid.uuid4().hex[:12]}"
@@ -223,7 +240,8 @@ class VoiceTurnLoop:
         self._pending_text: List[str] = []
         self._state = LISTENING
         self._allow_interruptions = _resolve_bool_extra(
-            self._extra, "allow_interruptions", DEFAULT_ALLOW_INTERRUPTIONS)
+            self._extra, "allow_interruptions", DEFAULT_ALLOW_INTERRUPTIONS
+        )
         # Telemetry: one structured record per turn, emitted as a JSON log line
         # when the turn ends; per-call summary on stop.
         self._tel: Dict[str, Any] = {}
@@ -250,16 +268,72 @@ class VoiceTurnLoop:
         # voice/timing logs report ms since this reference.
         self._turn_seq = 0
         self._t_ref: Optional[float] = None
+        self._unhealthy_reason: Optional[str] = None
+        self._unhealthy_at: Optional[float] = None
+        set_write_cb = getattr(self._transport, "set_first_write_callback", None)
+        if set_write_cb is not None:
+            set_write_cb(self._on_transport_first_write)
 
     def _mark(self, leg: str, **fields: Any) -> None:
         """INFO timing log: ms since the current turn's reference point."""
         now = time.monotonic()
         ref = self._t_ref if self._t_ref is not None else now
         extra = "".join(f" {k}={v}" for k, v in fields.items())
-        logger.info("voice/timing turn=%d %s t=+%.0fms%s",
-                    self._turn_seq, leg, (now - ref) * 1000.0, extra)
+        logger.info(
+            "voice/timing turn=%d %s t=+%.0fms%s",
+            self._turn_seq,
+            leg,
+            (now - ref) * 1000.0,
+            extra,
+        )
 
     # -- telemetry ----------------------------------------------------------
+
+    @property
+    def session_id(self) -> str:
+        return self._session_id
+
+    @property
+    def unhealthy_reason(self) -> Optional[str]:
+        return self._unhealthy_reason
+
+    def _telemetry_base(self) -> Dict[str, Any]:
+        base = {"session": self._session_id}
+        if self._call_session_id:
+            base["callSessionId"] = self._call_session_id
+        return base
+
+    def _emit_event(self, event: str, **fields: Any) -> None:
+        record = {"event": event, **self._telemetry_base(), **fields}
+        emit_telemetry(record)
+
+    def _transport_stat(self, name: str, default: Any = None) -> Any:
+        return getattr(self._transport, name, default)
+
+    def _transport_queue_snapshot(self) -> Dict[str, Any]:
+        return {
+            "chunks_enqueued": self._transport_stat("queued_chunks_since_mark"),
+            "chunks_cleared": self._transport_stat("cleared_chunks_since_mark"),
+            "last_clear_count": self._transport_stat("last_clear_count"),
+            "queue_depth": self._transport_stat("queue_depth"),
+        }
+
+    def _mark_unhealthy(self, reason: str) -> None:
+        if self._unhealthy_reason is not None:
+            return
+        self._unhealthy_reason = reason
+        self._unhealthy_at = time.monotonic()
+        logger.warning(
+            "voice/health: unhealthy reason=%s session=%s", reason, self._session_id
+        )
+
+    def _on_transport_first_write(self, when: float, queue_depth: int) -> None:
+        self._emit_event(
+            "first_frame_written",
+            turn=self._turn_seq,
+            t_monotonic=when,
+            queue_depth=queue_depth,
+        )
 
     def _tel_open(self) -> None:
         if not self._tel:
@@ -281,8 +355,7 @@ class VoiceTurnLoop:
         tel, self._tel = self._tel, {}
         if not tel:
             return
-        speech_end = tel.get("speech_end") or tel.get("vad_end") \
-            or tel.get("opened_at")
+        speech_end = tel.get("speech_end") or tel.get("vad_end") or tel.get("opened_at")
         first_written = getattr(self._transport, "first_write_t", None)
 
         def off(t: Optional[float]) -> Optional[int]:
@@ -290,10 +363,21 @@ class VoiceTurnLoop:
 
         perceived = off(first_written)
         substantive = off(tel.get("tts_first_audio"))
+        if substantive is None:
+            delivery_status = "no_assistant_audio"
+        elif perceived is not None:
+            delivery_status = "played"
+        elif status in ("interrupted", "call-ended"):
+            delivery_status = INTERRUPTED_BEFORE_PLAYBACK
+        else:
+            delivery_status = DELIVERY_FAILED
+        queue_snapshot = self._transport_queue_snapshot()
         record = {
             "event": "voice_turn",
+            **self._telemetry_base(),
             "turn": self._turn_seq,
             "status": status,
+            "audio_delivery_status": delivery_status,
             "eager_start": bool(tel.get("eager_start")),
             "turn_detector": tel.get("turn_detector", self._stt.provider),
             "stt_provider": self._stt.provider,
@@ -309,38 +393,75 @@ class VoiceTurnLoop:
                 "substantive_first_audio_ms": substantive,
                 "turn_total_ms": off(time.monotonic()),
             },
+            "audio_queue": queue_snapshot,
         }
         emit_telemetry(record)
         self._call_stats.append(record)
+        if delivery_status == DELIVERY_FAILED:
+            self._emit_event(
+                DELIVERY_FAILED,
+                turn=self._turn_seq,
+                status=status,
+                tts_first_audio_ms=substantive,
+                first_frame_written_ms=perceived,
+                audio_queue=queue_snapshot,
+            )
+            self._mark_unhealthy(DELIVERY_FAILED)
+        elif delivery_status == INTERRUPTED_BEFORE_PLAYBACK:
+            self._emit_event(
+                INTERRUPTED_BEFORE_PLAYBACK,
+                turn=self._turn_seq,
+                status=status,
+                tts_first_audio_ms=substantive,
+                audio_queue=queue_snapshot,
+            )
 
     def _emit_call_summary(self) -> None:
         turns = [r for r in self._call_stats if r["vad_end_ms"] is not None]
 
         def stats(key: str) -> Optional[Dict[str, int]]:
-            vals = sorted(r["totals"][key] for r in turns
-                          if r["totals"][key] is not None)
+            vals = sorted(
+                r["totals"][key] for r in turns if r["totals"][key] is not None
+            )
             if not vals:
                 return None
-            return {"median": vals[len(vals) // 2],
-                    "p90": vals[min(len(vals) - 1, int(len(vals) * 0.9))],
-                    "n": len(vals)}
+            return {
+                "median": vals[len(vals) // 2],
+                "p90": vals[min(len(vals) - 1, int(len(vals) * 0.9))],
+                "n": len(vals),
+            }
 
         raw_effort = self._extra.get("reasoning_effort")
         record = {
             "event": "voice_call_summary",
+            **self._telemetry_base(),
             "session": self._session_id,
             "turns": len(turns),
             "stt_provider": self._stt.provider,
             "model_override": _voice_model_name(),
-            "reasoning_effort": (str(raw_effort).strip()
-                                 if raw_effort is not None
-                                 and str(raw_effort).strip()
-                                 else "gateway-default"),
+            "reasoning_effort": (
+                str(raw_effort).strip()
+                if raw_effort is not None and str(raw_effort).strip()
+                else "gateway-default"
+            ),
             "eager_starts": sum(1 for r in turns if r["eager_start"]),
-            "barge_ins": sum(1 for r in self._call_stats
-                             if r["status"] == "interrupted"),
+            "barge_ins": sum(
+                1 for r in self._call_stats if r["status"] == "interrupted"
+            ),
+            "assistant_audio_delivery_failures": sum(
+                1 for r in turns if r.get("audio_delivery_status") == DELIVERY_FAILED
+            ),
             "perceived_first_audio_ms": stats("perceived_first_audio_ms"),
             "substantive_first_audio_ms": stats("substantive_first_audio_ms"),
+            "health": {
+                "stt_events": bool(turns),
+                "model_generation": any(r["first_delta_ms"] is not None for r in turns),
+                "tts_audio": any(r["tts_first_audio_ms"] is not None for r in turns),
+                "daily_audio_write": any(
+                    r["first_frame_written_ms"] is not None for r in turns
+                ),
+                "unhealthy_reason": self._unhealthy_reason,
+            },
         }
         emit_telemetry(record)
 
@@ -351,19 +472,19 @@ class VoiceTurnLoop:
         if sink is not None:
             sink(delta)
 
-    def _tool_tramp(self, event_type, tool_name=None, preview=None,
-                    args=None, **kwargs) -> None:
+    def _tool_tramp(
+        self, event_type, tool_name=None, preview=None, args=None, **kwargs
+    ) -> None:
         sink = self._tool_sink
         if sink is not None:
-            sink(event_type, tool_name=tool_name, preview=preview,
-                 args=args, **kwargs)
+            sink(event_type, tool_name=tool_name, preview=preview, args=args, **kwargs)
 
     def _make_agent(self):
         """Construct a turn agent (executor thread). Construction does not need
         the user message, so it can run before the turn starts."""
         return _create_voice_agent(
-            self._session_id, self._delta_tramp, self._tool_tramp,
-            extra=self._extra)
+            self._session_id, self._delta_tramp, self._tool_tramp, extra=self._extra
+        )
 
     def _preconstruct_agent(self) -> "concurrent.futures.Future":
         """Build the next turn's agent on a worker thread. Returns a concurrent
@@ -373,16 +494,20 @@ class VoiceTurnLoop:
         def _build() -> None:
             try:
                 fut.set_result(self._make_agent())
-            except BaseException as e:    # surface in the consuming turn
+            except BaseException as e:  # surface in the consuming turn
                 fut.set_exception(e)
 
-        threading.Thread(
-            target=_build, name="voice-agent-prewarm", daemon=True).start()
+        threading.Thread(target=_build, name="voice-agent-prewarm", daemon=True).start()
         return fut
 
     # -- main ---------------------------------------------------------------
 
     async def run(self) -> None:
+        self._emit_event(
+            "voice_call_started",
+            stt_provider=self._stt.provider,
+            turn_detector=self._stt.provider,
+        )
         consumer = asyncio.create_task(self._consume_flux())
         canned = self._extra.get("greeting_text")
         if canned:
@@ -401,7 +526,7 @@ class VoiceTurnLoop:
             pass
 
     async def stop(self) -> None:
-        await self._barge_in()           # kill any in-flight turn
+        await self._barge_in(reason="call-stop")  # kill any in-flight turn
         self._tel_emit("call-ended")
         self._emit_call_summary()
         self._stopped.set()
@@ -438,16 +563,38 @@ class VoiceTurnLoop:
         async for ev in self._stt.events():
             kind = ev.get("event")
             text = (ev.get("transcript") or "").strip()
+            if kind in (
+                "start_of_turn",
+                "eager_end_of_turn",
+                "turn_resumed",
+                "end_of_turn",
+            ):
+                self._emit_event(
+                    "voice_flux_event",
+                    turn=self._turn_seq,
+                    flux_event=kind,
+                    text_chars=len(text),
+                    state=self._state,
+                    transport_playing=bool(self._transport.is_playing()),
+                )
             if kind == "start_of_turn":
                 # Barge-in if the agent is thinking/speaking OR still has audio
                 # PLAYING OUT — state flips to LISTENING the instant the audio
                 # is queued, but the transport plays the tail for seconds after,
                 # during which the caller is still hearing the agent.
-                speaking = (self._state in (THINKING, SPEAKING)
-                            or self._transport.is_playing())
+                speaking = (
+                    self._state in (THINKING, SPEAKING) or self._transport.is_playing()
+                )
                 if speaking:
                     if self._allow_interruptions:
                         self._mark("flux-barge-in", state=self._state)
+                        self._emit_event(
+                            "barge_in_detected",
+                            turn=self._turn_seq,
+                            source="flux-start-of-turn",
+                            state=self._state,
+                            transport_playing=bool(self._transport.is_playing()),
+                        )
                         await self._barge_in()
                         eager_live = False
                 elif self._spare_agent_future is None:
@@ -461,7 +608,14 @@ class VoiceTurnLoop:
             elif kind == "turn_resumed":
                 if eager_live:
                     self._mark("flux-turn-resumed")
-                    await self._barge_in()   # cancel the speculative turn
+                    self._emit_event(
+                        "barge_in_detected",
+                        turn=self._turn_seq,
+                        source="flux-turn-resumed",
+                        state=self._state,
+                        transport_playing=bool(self._transport.is_playing()),
+                    )
+                    await self._barge_in()  # cancel the speculative turn
                     eager_live = False
             elif kind == "end_of_turn":
                 if eager_live:
@@ -485,27 +639,39 @@ class VoiceTurnLoop:
         if eager:
             self._tel_set("eager_start", True)
         self._mark("flux-turn-end", reason=reason, eager=eager)
+        self._emit_event(
+            "user_final_transcript",
+            turn=self._turn_seq,
+            text=text,
+            text_chars=len(text),
+            eager=eager,
+            eot_reason=reason,
+        )
         agent_future = self._spare_agent_future
         self._spare_agent_future = None
         self._start_turn(text, record_user=True, agent_future=agent_future)
 
     # -- agent turn ---------------------------------------------------------
 
-    def _start_turn(self, user_message: str, *, record_user: bool,
-                    agent_future=None) -> None:
+    def _start_turn(
+        self, user_message: str, *, record_user: bool, agent_future=None
+    ) -> None:
         self._state = THINKING
-        if self._t_ref is None:          # greeting turn has no vad-end
+        if self._t_ref is None:  # greeting turn has no vad-end
             self._t_ref = time.monotonic()
         self._mark("turn-start", chars=len(user_message))
         # Fresh latch BEFORE the task exists so a barge-in can never land
         # between turn creation and the executor publishing the agent.
         self._interrupt_latch = threading.Event()
         self._turn_task = asyncio.create_task(
-            self._execute_turn(user_message, record_user=record_user,
-                               agent_future=agent_future))
+            self._execute_turn(
+                user_message, record_user=record_user, agent_future=agent_future
+            )
+        )
 
-    async def _execute_turn(self, user_message: str, *, record_user: bool,
-                            agent_future=None) -> None:
+    async def _execute_turn(
+        self, user_message: str, *, record_user: bool, agent_future=None
+    ) -> None:
         loop = asyncio.get_running_loop()
         q: "asyncio.Queue[tuple]" = asyncio.Queue()
         agent_ref = self._agent_ref
@@ -535,11 +701,13 @@ class VoiceTurnLoop:
                     first_delta_seen.set()
                     self._mark("first-delta")
                     self._tel_set("first_delta")
+                    self._emit_event("model_first_token", turn=self._turn_seq)
                 _enqueue(("delta", delta))
 
         # Signature mirrors api_server._tool_progress (1637).
-        def _tool_progress(event_type, tool_name=None, preview=None,
-                           args=None, **kwargs) -> None:
+        def _tool_progress(
+            event_type, tool_name=None, preview=None, args=None, **kwargs
+        ) -> None:
             if event_type == "tool.started":
                 _enqueue(("tool", tool_name))
 
@@ -592,7 +760,20 @@ class VoiceTurnLoop:
                 first_audio_seen = True
                 self._mark("first-tts-audio-chunk", bytes=len(pcm))
                 self._tel_set("tts_first_audio")
-            await self._transport.send_audio(pcm)
+                self._emit_event(
+                    "cartesia_first_audio",
+                    turn=self._turn_seq,
+                    bytes=len(pcm),
+                )
+            chunks = await self._transport.send_audio(pcm)
+            if chunks is not None:
+                self._emit_event(
+                    "audio_enqueued_to_daily",
+                    turn=self._turn_seq,
+                    bytes=len(pcm),
+                    chunks=chunks,
+                    audio_queue=self._transport_queue_snapshot(),
+                )
 
         try:
             self._tts = await self._tts_factory(_on_audio)
@@ -620,12 +801,15 @@ class VoiceTurnLoop:
                     pass
             try:
                 result = await asyncio.wait_for(
-                    run_future, timeout=RUN_FUTURE_TIMEOUT_S)
+                    run_future, timeout=RUN_FUTURE_TIMEOUT_S
+                )
             except asyncio.TimeoutError:
                 logger.error(
                     "voice/turn: agent run did not finish within %.0fs after "
                     "the turn ended; abandoning executor thread (it may still "
-                    "be running and burning tokens)", RUN_FUTURE_TIMEOUT_S)
+                    "be running and burning tokens)",
+                    RUN_FUTURE_TIMEOUT_S,
+                )
                 result = None
             except Exception:
                 logger.exception("voice/turn: agent run failed")
@@ -636,6 +820,12 @@ class VoiceTurnLoop:
                     self._history.append({"role": "user", "content": user_message})
                 if final:
                     self._history.append({"role": "assistant", "content": final})
+                    self._emit_event(
+                        "assistant_final_transcript",
+                        turn=self._turn_seq,
+                        text=final,
+                        text_chars=len(final),
+                    )
             elif interrupted and record_user and not first_audio_seen:
                 # Barged in before the user heard ANY of the reply: their words
                 # must not vanish — feed them into the next turn.
@@ -693,10 +883,13 @@ class VoiceTurnLoop:
             # with no sentence-final punctuation, force one <flush> so the user
             # hears SOMETHING (~350ms later) instead of dead air.
             nonlocal first_flush_done, unsynthesized
-            if (first_send_t is not None and not punct_ever
-                    and not first_flush_done and unsynthesized > 0
-                    and time.monotonic() - first_send_t
-                    > FIRST_SENTENCE_FLUSH_S):
+            if (
+                first_send_t is not None
+                and not punct_ever
+                and not first_flush_done
+                and unsynthesized > 0
+                and time.monotonic() - first_send_t > FIRST_SENTENCE_FLUSH_S
+            ):
                 first_flush_done = True
                 self._mark("first-sentence-forced-flush", held_chars=unsynthesized)
                 self._tel_set("first_sentence")
@@ -726,8 +919,8 @@ class VoiceTurnLoop:
                 # keep the trailing partial word.
                 cut = max(buf.rfind(" "), buf.rfind("\n"), buf.rfind("\t"))
                 if cut >= 0:
-                    await _send(buf[:cut + 1], "words")
-                    buf = buf[cut + 1:]
+                    await _send(buf[: cut + 1], "words")
+                    buf = buf[cut + 1 :]
                 await _maybe_first_flush()
             elif kind == "done":
                 if buf.strip():
@@ -736,7 +929,7 @@ class VoiceTurnLoop:
 
     # -- barge-in -----------------------------------------------------------
 
-    async def _barge_in(self) -> None:
+    async def _barge_in(self, *, reason: str = "barge-in") -> None:
         t0 = time.monotonic()
         # Latch first: if the executor thread is still constructing the agent,
         # _run picks this up right after construction and interrupts before the
@@ -747,7 +940,7 @@ class VoiceTurnLoop:
         agent = self._agent_ref[0]
         if agent is not None:
             try:
-                agent.interrupt("user barge-in (voice)")   # api_server.py:4091
+                agent.interrupt("user barge-in (voice)")  # api_server.py:4091
             except Exception:
                 pass
         tts = self._tts
@@ -755,9 +948,20 @@ class VoiceTurnLoop:
             # Mute synchronously FIRST: no further TTS audio may reach the
             # transport while abort()'s socket close is in flight.
             tts.mute()
-        self._transport.clear_output()
-        logger.info("voice/timing barge-in audio-cleared in %.0fms",
-                    (time.monotonic() - t0) * 1000.0)
+        dropped = self._transport.clear_output()
+        if dropped is None:
+            dropped = 0
+        self._emit_event(
+            "audio_queue_cleared",
+            turn=self._turn_seq,
+            reason=reason,
+            dropped_chunks=dropped,
+            audio_queue=self._transport_queue_snapshot(),
+        )
+        logger.info(
+            "voice/timing barge-in audio-cleared in %.0fms",
+            (time.monotonic() - t0) * 1000.0,
+        )
         if tts is not None:
             await tts.abort()
         if self._turn_task is not None and not self._turn_task.done():
@@ -768,5 +972,6 @@ class VoiceTurnLoop:
                 pass
         self._turn_task = None
         self._state = LISTENING
-        logger.info("voice/turn: barge-in handled in %.0fms",
-                    (time.monotonic() - t0) * 1000.0)
+        logger.info(
+            "voice/turn: barge-in handled in %.0fms", (time.monotonic() - t0) * 1000.0
+        )

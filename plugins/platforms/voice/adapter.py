@@ -45,8 +45,9 @@ VALID_MODES = {"standalone", "orchestrated"}
 # ejected the agent — would otherwise leave the billable STT stream running.
 # The watchdog tears the call down when humans are gone, the call ended
 # remotely, or a hard age cap is hit.
-DEFAULT_IDLE_TEARDOWN_S = 60.0   # extra.idle_teardown_s
-DEFAULT_MAX_CALL_S = 1800.0      # extra.max_call_s
+DEFAULT_IDLE_TEARDOWN_S = 60.0  # extra.idle_teardown_s
+DEFAULT_MAX_CALL_S = 1800.0  # extra.max_call_s
+DEFAULT_MAX_RECOVERY_ATTEMPTS = 1
 WATCHDOG_POLL_S = 0.5
 
 
@@ -75,6 +76,7 @@ def _voice_modules():
 def _daily_available() -> bool:
     try:
         import daily  # noqa: F401
+
         return True
     except ImportError:
         return False
@@ -83,6 +85,7 @@ def _daily_available() -> bool:
 def _websockets_available() -> bool:
     try:
         import websockets  # noqa: F401
+
         return True
     except ImportError:
         return False
@@ -108,8 +111,7 @@ def _resolve_float_extra(extra: Dict[str, Any], key: str, default: float) -> flo
     try:
         return float(raw)
     except (TypeError, ValueError):
-        logger.warning("voice: invalid %s=%r; using default %s",
-                       key, raw, default)
+        logger.warning("voice: invalid %s=%r; using default %s", key, raw, default)
         return default
 
 
@@ -124,6 +126,18 @@ def _resolve_opt_float_extra(extra: Dict[str, Any], key: str) -> Optional[float]
     except (TypeError, ValueError):
         logger.warning("voice: invalid %s=%r; ignoring", key, raw)
         return None
+
+
+def _resolve_int_extra(extra: Dict[str, Any], key: str, default: int) -> int:
+    raw = extra.get(key)
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("voice: invalid %s=%r; using default %s", key, raw, default)
+        return default
+    return max(0, value)
 
 
 def _resolve_mode(extra: Dict[str, Any]) -> str:
@@ -156,7 +170,7 @@ def register(ctx) -> None:
         validate_config=validate_config,
         is_connected=is_connected,
         required_env=["DEEPGRAM_API_KEY", "CARTESIA_API_KEY"],
-        install_hint='uv sync --extra voice-platform   # daily-python + websockets',
+        install_hint="uv sync --extra voice-platform   # daily-python + websockets",
         pii_safe=True,
         emoji="📞",
         allow_update_command=False,
@@ -192,8 +206,24 @@ class VoiceAdapter(BasePlatformAdapter):
         self._control = None
         self._call_lock = asyncio.Lock()
         self._active_call: Optional[Dict[str, Any]] = None
+        self._process_marker_emitted = False
+
+    def _emit_voice_telemetry(self, record: Dict[str, Any]) -> None:
+        (_, turn_loop, _, _, _) = _voice_modules()
+        turn_loop.emit_telemetry(record)
+
+    def _emit_process_startup_once(self) -> None:
+        if self._process_marker_emitted:
+            return
+        self._process_marker_emitted = True
+        self._emit_voice_telemetry({
+            "event": "voice_process_startup",
+            "mode": self._mode,
+            "pid": os.getpid(),
+        })
 
     async def connect(self) -> bool:
+        self._emit_process_startup_once()
         if self._mode == "orchestrated":
             (*_, control_channel) = _voice_modules()
             self._control = control_channel.ControlChannel(
@@ -217,90 +247,163 @@ class VoiceAdapter(BasePlatformAdapter):
         # you want to reach your agent.
         logger.warning(
             "voice: standalone call ready — open this URL to talk to your "
-            "agent (keep the token private):\n    %s", share_url)
+            "agent (keep the token private):\n    %s",
+            share_url,
+        )
         return True
 
     async def _handle_control_event(self, event: Dict[str, Any]) -> None:
         action = event.get("action")
         if action == "join_room":
-            await self._start_call(event["roomUrl"], event["token"])
+            await self._start_call(
+                event["roomUrl"],
+                event["token"],
+                call_session_id=(
+                    event.get("callSessionId") or event.get("call_session_id")
+                ),
+            )
         elif action == "leave_room":
             await self._end_call("control-leave")
 
-    async def _start_call(self, room_url: str, token: str) -> None:
-        daily_transport, turn_loop, cartesia_tts, stt_mod, _ = _voice_modules()
+    async def _start_call(
+        self,
+        room_url: str,
+        token: str,
+        *,
+        call_session_id: Optional[str] = None,
+        recovery_count: int = 0,
+    ) -> None:
         async with self._call_lock:
             if self._active_call is not None:
                 await self._end_call_locked("replaced-by-new-call")
-            loop = asyncio.get_running_loop()
-            extra = self.config.extra or {}
-
-            # STT: streaming ASR + model-integrated turn detection
-            # (start/eager-end/resumed/end-of-turn events the turn loop reacts
-            # to). Deepgram Flux is the default; the make_stt factory is the
-            # seam so another provider (e.g. Cartesia Ink-2) can be A/B'd
-            # behind the same port. Inbound caller audio is at the Daily
-            # SPEAKER_RATE; each adapter handles its own rate (Flux resamples
-            # 24k->16k internally; Ink-2 accepts the native rate). The factory
-            # resolves the provider's API key and raises if it's missing.
-            stt_provider = (extra.get("stt_provider")
-                            or "deepgram_flux").strip().lower()
-            stt = stt_mod.make_stt(
-                stt_provider,
-                input_rate=daily_transport.SPEAKER_RATE,
-                extra=extra,
+            await self._start_call_locked(
+                room_url,
+                token,
+                call_session_id=call_session_id,
+                recovery_count=recovery_count,
             )
-            await stt.start()
-            logger.info("voice: STT provider=%s", stt.provider)
 
-            async def on_audio_in(pcm: bytes) -> None:
-                await stt.send_audio(pcm)
+    async def _start_call_locked(
+        self,
+        room_url: str,
+        token: str,
+        *,
+        call_session_id: Optional[str] = None,
+        recovery_count: int = 0,
+    ) -> None:
+        daily_transport, turn_loop, cartesia_tts, stt_mod, _ = _voice_modules()
+        loop = asyncio.get_running_loop()
+        extra = self.config.extra or {}
 
-            transport = daily_transport.DailyTransport(loop, on_audio_in)
-            await transport.join(room_url, token)
+        # STT: streaming ASR + model-integrated turn detection
+        # (start/eager-end/resumed/end-of-turn events the turn loop reacts
+        # to). Deepgram Flux is the default; the make_stt factory is the
+        # seam so another provider (e.g. Cartesia Ink-2) can be A/B'd
+        # behind the same port. Inbound caller audio is at the Daily
+        # SPEAKER_RATE; each adapter handles its own rate (Flux resamples
+        # 24k->16k internally; Ink-2 accepts the native rate). The factory
+        # resolves the provider's API key and raises if it's missing.
+        stt_provider = (extra.get("stt_provider") or "deepgram_flux").strip().lower()
+        stt = stt_mod.make_stt(
+            stt_provider,
+            input_rate=daily_transport.SPEAKER_RATE,
+            extra=extra,
+        )
+        await stt.start()
+        logger.info("voice: STT provider=%s", stt.provider)
+        self._emit_voice_telemetry({
+            "event": (
+                "deepgram_flux_connected"
+                if stt.provider == "deepgram_flux"
+                else "voice_stt_connected"
+            ),
+            "callSessionId": call_session_id,
+            "stt_provider": stt.provider,
+            "recovery_count": recovery_count,
+        })
 
-            # TTS: Cartesia (default). ONE persistent socket for the whole call
-            # (connect is too costly to pay per turn), opened here so turn 1 is
-            # fast. The per-turn tts_factory is the seam for another provider.
-            tts_provider = (extra.get("tts_provider") or "cartesia").strip().lower()
-            if tts_provider != "cartesia":
-                raise RuntimeError(
-                    f"unsupported tts_provider={tts_provider!r}; "
-                    "'cartesia' is the bundled provider")
-            cartesia_key = os.getenv("CARTESIA_API_KEY", "").strip()
-            if not cartesia_key:
-                raise RuntimeError("CARTESIA_API_KEY is not set")
-            cartesia_voice = (
-                extra.get("cartesia_voice_id")
-                or os.getenv("CARTESIA_VOICE_ID", "").strip()
+        async def on_audio_in(pcm: bytes) -> None:
+            await stt.send_audio(pcm)
+
+        transport = daily_transport.DailyTransport(loop, on_audio_in)
+        await transport.join(room_url, token)
+        self._emit_voice_telemetry({
+            "event": "daily_joined",
+            "callSessionId": call_session_id,
+            "room_url": room_url,
+            "recovery_count": recovery_count,
+        })
+
+        # TTS: Cartesia (default). ONE persistent socket for the whole call
+        # (connect is too costly to pay per turn), opened here so turn 1 is
+        # fast. The per-turn tts_factory is the seam for another provider.
+        tts_provider = (extra.get("tts_provider") or "cartesia").strip().lower()
+        if tts_provider != "cartesia":
+            raise RuntimeError(
+                f"unsupported tts_provider={tts_provider!r}; "
+                "'cartesia' is the bundled provider"
             )
-            tts_client = cartesia_tts.CartesiaTTSClient(
-                cartesia_key,
-                cartesia_voice,
-                model=extra.get("cartesia_model") or cartesia_tts.DEFAULT_MODEL,
-                speed=_resolve_opt_float_extra(extra, "tts_speed"),
-                volume=_resolve_opt_float_extra(extra, "tts_volume"),
-                emotion=(extra.get("tts_emotion") or None),
-            )
-            await tts_client.connect()
-            logger.info("voice: TTS provider=cartesia model=%s voice=%s",
-                        tts_client._model, cartesia_voice)
+        cartesia_key = os.getenv("CARTESIA_API_KEY", "").strip()
+        if not cartesia_key:
+            raise RuntimeError("CARTESIA_API_KEY is not set")
+        cartesia_voice = (
+            extra.get("cartesia_voice_id") or os.getenv("CARTESIA_VOICE_ID", "").strip()
+        )
+        tts_client = cartesia_tts.CartesiaTTSClient(
+            cartesia_key,
+            cartesia_voice,
+            model=extra.get("cartesia_model") or cartesia_tts.DEFAULT_MODEL,
+            speed=_resolve_opt_float_extra(extra, "tts_speed"),
+            volume=_resolve_opt_float_extra(extra, "tts_volume"),
+            emotion=(extra.get("tts_emotion") or None),
+        )
+        await tts_client.connect()
+        logger.info(
+            "voice: TTS provider=cartesia model=%s voice=%s",
+            tts_client._model,
+            cartesia_voice,
+        )
+        self._emit_voice_telemetry({
+            "event": "cartesia_tts_connected",
+            "callSessionId": call_session_id,
+            "tts_provider": "cartesia",
+            "model": tts_client._model,
+            "voice": cartesia_voice,
+            "recovery_count": recovery_count,
+        })
 
-            async def tts_factory(on_audio):
-                turn = tts_client.new_turn(on_audio)
-                await turn.open()
-                return turn
+        async def tts_factory(on_audio):
+            turn = tts_client.new_turn(on_audio)
+            await turn.open()
+            return turn
 
-            vloop = turn_loop.VoiceTurnLoop(
-                stt, tts_factory, transport, extra=extra)
-            task = asyncio.create_task(vloop.run())
-            self._active_call = {
-                "stt": stt, "transport": transport, "loop": vloop,
-                "task": task, "tts_client": tts_client,
-                "started_at": time.monotonic(), "room_url": room_url}
-            self._active_call["watchdog"] = asyncio.create_task(
-                self._call_watchdog(transport))
-            logger.info("voice: call started in %s", room_url)
+        vloop = turn_loop.VoiceTurnLoop(
+            stt, tts_factory, transport, extra=extra, call_session_id=call_session_id
+        )
+        task = asyncio.create_task(vloop.run())
+        self._active_call = {
+            "stt": stt,
+            "transport": transport,
+            "loop": vloop,
+            "task": task,
+            "tts_client": tts_client,
+            "started_at": time.monotonic(),
+            "room_url": room_url,
+            "token": token,
+            "call_session_id": call_session_id,
+            "recovery_count": recovery_count,
+        }
+        self._active_call["watchdog"] = asyncio.create_task(
+            self._call_watchdog(transport)
+        )
+        self._emit_voice_telemetry({
+            "event": "voice_adapter_call_started",
+            "callSessionId": call_session_id,
+            "room_url": room_url,
+            "recovery_count": recovery_count,
+            "session": vloop.session_id,
+        })
+        logger.info("voice: call started in %s", room_url)
 
     async def _call_watchdog(self, transport) -> None:
         """Tear the call down when it is no longer worth paying for:
@@ -313,9 +416,9 @@ class VoiceAdapter(BasePlatformAdapter):
         makes the cost of every call auditable."""
         extra = self.config.extra or {}
         idle_teardown_s = _resolve_float_extra(
-            extra, "idle_teardown_s", DEFAULT_IDLE_TEARDOWN_S)
-        max_call_s = _resolve_float_extra(
-            extra, "max_call_s", DEFAULT_MAX_CALL_S)
+            extra, "idle_teardown_s", DEFAULT_IDLE_TEARDOWN_S
+        )
+        max_call_s = _resolve_float_extra(extra, "max_call_s", DEFAULT_MAX_CALL_S)
         idle_since: Optional[float] = None
         while True:
             await asyncio.sleep(WATCHDOG_POLL_S)
@@ -325,19 +428,35 @@ class VoiceAdapter(BasePlatformAdapter):
             now = time.monotonic()
             age_s = now - call["started_at"]
             reason = None
+            unhealthy_reason = getattr(call.get("loop"), "unhealthy_reason", None)
             abnormal = transport.abnormal_end
-            if abnormal is not None:
+            if unhealthy_reason:
+                logger.warning(
+                    "voice: WATCHDOG recovery reason=%s age_s=%.0f recovery_count=%d",
+                    unhealthy_reason,
+                    age_s,
+                    call.get("recovery_count", 0),
+                )
+                await self._recover_call(unhealthy_reason)
+                return
+            elif abnormal is not None:
                 reason = "remote-end"
                 logger.warning(
                     "voice: WATCHDOG teardown reason=%s detail=%r age_s=%.0f "
                     "— call ended remotely (ejection/expiry/error)",
-                    reason, abnormal, age_s)
+                    reason,
+                    abnormal,
+                    age_s,
+                )
             elif age_s >= max_call_s:
                 reason = "max-call-duration"
                 logger.warning(
                     "voice: WATCHDOG teardown reason=%s age_s=%.0f "
                     "max_call_s=%.0f — hard cost cap hit",
-                    reason, age_s, max_call_s)
+                    reason,
+                    age_s,
+                    max_call_s,
+                )
             elif transport.remote_participant_count == 0:
                 if idle_since is None:
                     idle_since = now
@@ -347,12 +466,79 @@ class VoiceAdapter(BasePlatformAdapter):
                         "voice: WATCHDOG teardown reason=%s idle_s=%.0f "
                         "idle_teardown_s=%.0f age_s=%.0f — caller gone "
                         "(tab closed / never joined)",
-                        reason, now - idle_since, idle_teardown_s, age_s)
+                        reason,
+                        now - idle_since,
+                        idle_teardown_s,
+                        age_s,
+                    )
             else:
                 idle_since = None
             if reason is not None:
                 await self._end_call(reason)
                 return
+
+    async def _recover_call(self, reason: str) -> None:
+        """Restart the live voice pipeline once when the turn loop proves the
+        assistant generated TTS audio but Daily never wrote a first frame.
+
+        This is intentionally narrower than a generic "self-heal": no VAD or
+        barge-in thresholds change, and the attempt count is bounded by config.
+        Every attempted/skipped/succeeded/failed recovery is emitted to durable
+        voice telemetry."""
+        async with self._call_lock:
+            call = self._active_call
+            if call is None:
+                return
+            extra = self.config.extra or {}
+            max_attempts = _resolve_int_extra(
+                extra, "max_recovery_attempts", DEFAULT_MAX_RECOVERY_ATTEMPTS
+            )
+            recovery_count = int(call.get("recovery_count", 0))
+            call_session_id = call.get("call_session_id")
+            payload = {
+                "reason": reason,
+                "callSessionId": call_session_id,
+                "room_url": call.get("room_url"),
+                "recovery_count": recovery_count,
+                "max_recovery_attempts": max_attempts,
+            }
+            if recovery_count >= max_attempts:
+                self._emit_voice_telemetry({
+                    "event": "voice_recovery_skipped",
+                    **payload,
+                })
+                await self._end_call_locked(f"unhealthy:{reason}")
+                return
+
+            room_url = call["room_url"]
+            token = call["token"]
+            self._emit_voice_telemetry({
+                "event": "voice_recovery_attempted",
+                **payload,
+                "next_recovery_count": recovery_count + 1,
+            })
+            await self._end_call_locked(f"recovering:{reason}")
+            try:
+                await self._start_call_locked(
+                    room_url,
+                    token,
+                    call_session_id=call_session_id,
+                    recovery_count=recovery_count + 1,
+                )
+            except Exception as exc:
+                self._emit_voice_telemetry({
+                    "event": "voice_recovery_failed",
+                    **payload,
+                    "error": str(exc),
+                    "next_recovery_count": recovery_count + 1,
+                })
+                logger.exception("voice: recovery failed reason=%s", reason)
+                return
+            self._emit_voice_telemetry({
+                "event": "voice_recovery_succeeded",
+                **payload,
+                "next_recovery_count": recovery_count + 1,
+            })
 
     async def _end_call(self, reason: str) -> None:
         async with self._call_lock:
@@ -389,14 +575,15 @@ class VoiceAdapter(BasePlatformAdapter):
             "event": "voice_call_teardown",
             "reason": reason,
             "room_url": call.get("room_url"),
+            "callSessionId": call.get("call_session_id"),
+            "recovery_count": call.get("recovery_count", 0),
             "call_s": round(time.monotonic() - call["started_at"], 1),
             "asr_seconds_est": round(call["stt"].asr_seconds_est, 1),
             "stt_provider": call["stt"].provider,
         }
         # Durable + WARNING-level emit: this is the per-call cost record; it
         # must survive log levels/rotation on the agent volume.
-        (_, turn_loop, _, _, _) = _voice_modules()
-        turn_loop.emit_telemetry(summary)
+        self._emit_voice_telemetry(summary)
         logger.info("voice: call ended reason=%s", reason)
 
     async def _create_standalone_room(self) -> Tuple[str, str, str]:
@@ -411,7 +598,8 @@ class VoiceAdapter(BasePlatformAdapter):
         exp = int(time.time()) + STANDALONE_ROOM_TTL_S
         async with httpx.AsyncClient(timeout=15.0) as client:
             room_resp = await client.post(
-                f"{DAILY_API}/rooms", headers=headers,
+                f"{DAILY_API}/rooms",
+                headers=headers,
                 json={"privacy": "private", "properties": {"exp": exp}},
             )
             room_resp.raise_for_status()
@@ -419,9 +607,15 @@ class VoiceAdapter(BasePlatformAdapter):
 
             async def _mint_token(is_owner: bool) -> str:
                 resp = await client.post(
-                    f"{DAILY_API}/meeting-tokens", headers=headers,
-                    json={"properties": {"room_name": room["name"],
-                                         "is_owner": is_owner, "exp": exp}},
+                    f"{DAILY_API}/meeting-tokens",
+                    headers=headers,
+                    json={
+                        "properties": {
+                            "room_name": room["name"],
+                            "is_owner": is_owner,
+                            "exp": exp,
+                        }
+                    },
                 )
                 resp.raise_for_status()
                 return resp.json()["token"]

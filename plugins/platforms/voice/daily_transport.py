@@ -56,10 +56,10 @@ logger = logging.getLogger(__name__)
 
 MIC_DEVICE = "hermes-voice-mic"
 SPEAKER_DEVICE = "hermes-voice-speaker"
-MIC_RATE = 48000                # agent TTS output rate (Cartesia 48k)
-OUT_CHUNK_BYTES = 7680          # 80ms @ 48kHz s16le mono — barge-in flush granularity
-SPEAKER_RATE = 24000            # inbound caller rate (Flux STT resamples 24k->16k)
-IN_CHUNK_FRAMES = 1920          # 80 ms @ 24 kHz — one ASR chunk per read
+MIC_RATE = 48000  # agent TTS output rate (Cartesia 48k)
+OUT_CHUNK_BYTES = 7680  # 80ms @ 48kHz s16le mono — barge-in flush granularity
+SPEAKER_RATE = 24000  # inbound caller rate (Flux STT resamples 24k->16k)
+IN_CHUNK_FRAMES = 1920  # 80 ms @ 24 kHz — one ASR chunk per read
 
 # Subscribe to participant microphones only (wav_audio_receive.py pattern);
 # video is never wanted on a voice call.
@@ -112,11 +112,14 @@ def _ensure_daily() -> None:
         if _initialized:
             return
         from daily import Daily
+
         Daily.init()
         _mic = Daily.create_microphone_device(
-            MIC_DEVICE, sample_rate=MIC_RATE, channels=1)
+            MIC_DEVICE, sample_rate=MIC_RATE, channels=1
+        )
         _speaker = Daily.create_speaker_device(
-            SPEAKER_DEVICE, sample_rate=SPEAKER_RATE, channels=1)
+            SPEAKER_DEVICE, sample_rate=SPEAKER_RATE, channels=1
+        )
         Daily.select_speaker_device(SPEAKER_DEVICE)
         _initialized = True
 
@@ -158,10 +161,15 @@ class DailyTransport:
         # stamps the first real frame write after arming.
         self._first_write_t: Optional[float] = None
         self._write_mark_armed = False
+        self._queued_chunks_since_mark = 0
+        self._cleared_chunks_since_mark = 0
+        self._last_clear_count = 0
+        self._first_write_callback: Optional[Callable[[float, int], None]] = None
 
     async def join(self, room_url: str, token: str, timeout: float = 15.0) -> None:
         _ensure_daily()
         from daily import CallClient
+
         self._client = CallClient(event_handler=_make_event_handler(self))
         self._client.update_subscription_profiles(_SUBSCRIPTION_PROFILES)
 
@@ -203,12 +211,14 @@ class DailyTransport:
         self._running = True
         self._last_audio_in_t = time.monotonic()
         self._reader = threading.Thread(
-            target=self._read_loop, name="voice-daily-reader", daemon=True)
+            target=self._read_loop, name="voice-daily-reader", daemon=True
+        )
         self._writer = threading.Thread(
-            target=self._write_loop, name="voice-daily-writer", daemon=True)
+            target=self._write_loop, name="voice-daily-writer", daemon=True
+        )
         self._keepalive = threading.Thread(
-            target=self._keepalive_loop, name="voice-daily-keepalive",
-            daemon=True)
+            target=self._keepalive_loop, name="voice-daily-keepalive", daemon=True
+        )
         self._reader.start()
         self._writer.start()
         self._keepalive.start()
@@ -225,8 +235,7 @@ class DailyTransport:
         with self._presence_lock:
             self._remote_ids.add(pid)
             count = len(self._remote_ids)
-        logger.info("voice/daily: participant joined id=%s remote_count=%d",
-                    pid, count)
+        logger.info("voice/daily: participant joined id=%s remote_count=%d", pid, count)
 
     def _on_participant_left(self, participant, reason) -> None:
         pid = (participant or {}).get("id")
@@ -235,7 +244,10 @@ class DailyTransport:
             count = len(self._remote_ids)
         logger.warning(
             "voice/daily: participant left id=%s reason=%s remote_count=%d",
-            pid, reason, count)
+            pid,
+            reason,
+            count,
+        )
 
     def _on_call_state_updated(self, state) -> None:
         logger.info("voice/daily: call state -> %s", state)
@@ -245,7 +257,8 @@ class DailyTransport:
             self._abnormal_end = "left"
             logger.warning(
                 "voice/daily: call ended remotely (ejected/expired) — "
-                "flagging for teardown")
+                "flagging for teardown"
+            )
 
     def _on_client_error(self, message) -> None:
         self._abnormal_end = f"error: {message}"
@@ -266,7 +279,7 @@ class DailyTransport:
 
     def _read_loop(self) -> None:
         while self._running:
-            frames = _speaker.read_frames(IN_CHUNK_FRAMES)   # blocking 80 ms
+            frames = _speaker.read_frames(IN_CHUNK_FRAMES)  # blocking 80 ms
             if not frames:
                 # Empty reads happen at teardown / before audio flows; avoid
                 # a hot spin since only non-empty reads pace real time.
@@ -291,8 +304,7 @@ class DailyTransport:
             if not self._running or self._teardown.is_set():
                 return
             if time.monotonic() - self._last_audio_in_t >= 0.16:
-                asyncio.run_coroutine_threadsafe(
-                    self._on_audio_in(silence), self._loop)
+                asyncio.run_coroutine_threadsafe(self._on_audio_in(silence), self._loop)
 
     def _write_loop(self) -> None:
         # WALL-CLOCK paced: write_frames sometimes returns faster than real
@@ -313,7 +325,9 @@ class DailyTransport:
                 if burst_audio_s > 0.0:
                     logger.info(
                         "voice/daily: write burst ended audio_s=%.2f wall_s=%.2f",
-                        burst_audio_s, time.monotonic() - burst_t0)
+                        burst_audio_s,
+                        time.monotonic() - burst_t0,
+                    )
                     burst_audio_s = 0.0
                 continue
             if chunk is None:
@@ -322,45 +336,89 @@ class DailyTransport:
             if burst_audio_s == 0.0:
                 burst_t0 = now
                 next_due = now
-                logger.info("voice/daily: write burst started qsize=%d",
-                            self._out_q.qsize())
+                logger.info(
+                    "voice/daily: write burst started qsize=%d", self._out_q.qsize()
+                )
             delay = next_due - now
             if delay > 0:
                 time.sleep(delay)
             elif delay < -0.5:
-                next_due = time.monotonic()   # writer fell behind; resync
+                next_due = time.monotonic()  # writer fell behind; resync
             t0 = time.monotonic()
             if self._write_mark_armed:
                 self._write_mark_armed = False
                 self._first_write_t = t0
+                cb = self._first_write_callback
+                if cb is not None:
+                    try:
+                        cb(t0, self._out_q.qsize())
+                    except Exception:
+                        logger.exception(
+                            "voice/daily: first-write telemetry callback failed"
+                        )
             _mic.write_frames(chunk)
             chunk_s = len(chunk) / 2.0 / MIC_RATE
             next_due += chunk_s
             burst_audio_s += chunk_s
 
-    async def send_audio(self, pcm: bytes) -> None:
+    async def send_audio(self, pcm: bytes) -> int:
         """Queue agent speech (s16le mono 48 kHz) for the caller.
 
         Split into <=80ms sub-chunks so the wall-clock writer caps Daily's
         internal buffer tightly: barge-in's clear_output then leaves only
         ~one 80ms chunk of unstoppable audio regardless of the TTS provider's
-        native chunk size (Cartesia emits ~190ms chunks)."""
+        native chunk size (Cartesia emits ~190ms chunks). Returns the number
+        of chunks queued so turn telemetry can distinguish "TTS produced audio"
+        from "Daily writer consumed audio"."""
         if len(pcm) <= OUT_CHUNK_BYTES:
             self._out_q.put(pcm)
-            return
+            self._queued_chunks_since_mark += 1
+            return 1
+        chunks = 0
         for i in range(0, len(pcm), OUT_CHUNK_BYTES):
-            self._out_q.put(pcm[i:i + OUT_CHUNK_BYTES])
+            self._out_q.put(pcm[i : i + OUT_CHUNK_BYTES])
+            chunks += 1
+        self._queued_chunks_since_mark += chunks
+        return chunks
 
     def reset_write_mark(self) -> None:
         """Arm the first_frame_written telemetry mark for a new turn."""
         self._first_write_t = None
         self._write_mark_armed = True
+        self._queued_chunks_since_mark = 0
+        self._cleared_chunks_since_mark = 0
+        self._last_clear_count = 0
+
+    def set_first_write_callback(
+        self,
+        callback: Optional[Callable[[float, int], None]],
+    ) -> None:
+        """Install a sync callback fired by the writer thread when the first
+        marked frame is written. The turn loop uses this to emit a durable
+        first-frame event without changing the writer's pacing."""
+        self._first_write_callback = callback
 
     @property
     def first_write_t(self) -> Optional[float]:
         """Monotonic time of the first frame written after the last
         reset_write_mark(), or None if nothing was written yet."""
         return self._first_write_t
+
+    @property
+    def queued_chunks_since_mark(self) -> int:
+        return self._queued_chunks_since_mark
+
+    @property
+    def cleared_chunks_since_mark(self) -> int:
+        return self._cleared_chunks_since_mark
+
+    @property
+    def last_clear_count(self) -> int:
+        return self._last_clear_count
+
+    @property
+    def queue_depth(self) -> int:
+        return self._out_q.qsize()
 
     def is_playing(self) -> bool:
         """True while agent audio is still queued to play out to the caller.
@@ -372,8 +430,10 @@ class DailyTransport:
         the caller hears the agent talk over them with no way to cut it."""
         return not self._out_q.empty()
 
-    def clear_output(self) -> None:
-        """Barge-in: drop all queued (unplayed) agent audio."""
+    def clear_output(self) -> int:
+        """Barge-in: drop all queued (unplayed) agent audio.
+
+        Returns the dropped chunk count for telemetry/recovery diagnostics."""
         dropped = 0
         try:
             while True:
@@ -381,7 +441,10 @@ class DailyTransport:
                 dropped += 1
         except queue.Empty:
             pass
+        self._last_clear_count = dropped
+        self._cleared_chunks_since_mark += dropped
         logger.info("voice/daily: cleared %d queued chunks", dropped)
+        return dropped
 
     def begin_teardown(self) -> None:
         """Stop feeding billable keep-alive silence IMMEDIATELY. Called by

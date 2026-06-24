@@ -9,7 +9,8 @@ exponential backoff with 20% jitter). Uses hermes-core httpx (0.28.x);
 no new dependency.
 
 Events (control-plane contract, Phase 3 Lane B):
-    {"action": "join_room", "roomUrl": "...", "token": "..."}
+    {"action": "join_room", "roomUrl": "...", "token": "...",
+     "callSessionId": "..."}  # callSessionId optional for older clients
     {"action": "leave_room"}
 """
 
@@ -39,7 +40,8 @@ class ControlChannel:
         if not base_url or not api_key:
             raise ValueError(
                 "SECOND_BRAIN_URL and SECOND_BRAIN_MCP_KEY are required "
-                "for orchestrated voice mode")
+                "for orchestrated voice mode"
+            )
         self._url = base_url.rstrip("/") + "/api/agents/events"
         self._api_key = api_key
         self._on_event = on_event
@@ -57,7 +59,8 @@ class ControlChannel:
         while self._running:
             try:
                 async with self._client.stream(
-                    "GET", self._url,
+                    "GET",
+                    self._url,
                     headers={
                         "Accept": "text/event-stream",
                         "Authorization": f"Bearer {self._api_key}",
@@ -67,7 +70,8 @@ class ControlChannel:
                     if response.status_code != 200:
                         logger.error(
                             "voice/control: subscribe failed (HTTP %d)",
-                            response.status_code)
+                            response.status_code,
+                        )
                     else:
                         backoff = RETRY_INITIAL
                         logger.info("voice/control: subscribed to %s", self._url)
@@ -88,8 +92,8 @@ class ControlChannel:
             except Exception as e:
                 if self._running:
                     logger.warning(
-                        "voice/control: stream error: %s (retry in %.0fs)",
-                        e, backoff)
+                        "voice/control: stream error: %s (retry in %.0fs)", e, backoff
+                    )
             if self._running:
                 # 20% jitter against thundering herd (signal.py pattern).
                 await asyncio.sleep(backoff + backoff * 0.2 * random.random())
